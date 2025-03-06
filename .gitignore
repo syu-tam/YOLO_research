@@ -139,6 +139,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# reulst
+result/
+
 # datasets and projects (ignore /datasets dir at root only to allow for docs/en/datasets dir)
 /datasets
 runs/

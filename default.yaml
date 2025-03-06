@@ -1,0 +1,127 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Default training settings and hyperparameters for medium-augmentation COCO training
+
+task: detect # (str) YOLOタスクの指定。例: detect（物体検出）、segment（セグメンテーション）、classify（分類）、pose（姿勢推定）
+mode: train # (str) YOLOモードの指定。例: train（訓練）、val（検証）、predict（予測）、export（エクスポート）、track（追跡）、benchmark（ベンチマーク）
+
+# トレーニング設定 ----------------------------------------------------------------------------------------------------
+model: # (str, 任意) モデルファイルのパス。例: yolov8n.pt、yolov8n.yaml
+data: # (str, 任意) データファイルのパス。例: coco128.yaml
+epochs: 100 # (int) 訓練するエポック数
+time: # (float, 任意) 訓練にかける時間（時間単位）。指定されると、epochsより優先される
+patience: 100 # (int) 改善が見られない場合に早期停止するエポック数
+batch: 16 # (int) バッチサイズ（-1で自動調整）
+imgsz: 640 # (int | list) 入力画像のサイズ。trainおよびvalモードでは整数、predictやexportモードではリスト形式（[w,h]）
+save: True # (bool) 訓練のチェックポイントや予測結果を保存するかどうか
+save_period: -1 # (int) 指定したエポックごとにチェックポイントを保存（1未満で無効）
+val_period: 1 # (int) 検証を行うエポック間隔
+cache: False # (bool) キャッシュを使用してデータをロードするか（True/ram、diskまたはFalse）
+device:  # (int | str | list, 任意) 実行するデバイスを指定。例: cuda device=0, device=0,1,2,3, または cpu
+workers: 16 # (int) データローディングのワーカースレッド数（DDPの場合はRANKごとに）
+project: result # (str, 任意) プロジェクト名
+name:  # (str, 任意) 実験名。結果は 'project/name' ディレクトリに保存
+exist_ok: False # (bool) 既存の実験ディレクトリを上書きするかどうか
+pretrained: True # (bool | str) 事前学習済みモデルを使用するかどうか（Trueまたは、モデルの重みをロードするパス）
+optimizer: auto # (str) 使用するオプティマイザ。選択肢=[SGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, auto]
+verbose: True # (bool) 詳細な出力を表示するかどうか
+seed: 42 # (int) 再現性のためのランダムシード
+deterministic: True # (bool) 決定論的モードを有効にするかどうか
+single_cls: False # (bool) マルチクラスデータを単一クラスとして訓練するか
+rect: False # (bool) 'train'モードでの矩形トレーニング、または 'val'モードでの矩形検証
+cos_lr: False # (bool) コサイン学習率スケジューラを使用するかどうか
+close_mosaic: 10 # (int) 最後のエポックでモザイク増強を無効にする（0で無効）
+resume: False # (bool) 最後のチェックポイントから訓練を再開するかどうか
+amp: True # (bool) 自動混合精度 (AMP) トレーニングを実行するかどうか（True/False）
+fraction: 1.0 # (float) 訓練に使用するデータセットの割合（デフォルトは1.0、全画像を使用）
+profile: False # (bool) ONNXおよびTensorRTの速度をトレーニング中にロギング用にプロファイル
+freeze: None # (int | list, 任意) 訓練中にフリーズするレイヤーの数またはリスト
+multi_scale: False # (bool) 訓練時にマルチスケールを使用するかどうか
+# セグメンテーション
+overlap_mask: True # (bool) セグメントトレーニング時にマスクを重ねるかどうか
+mask_ratio: 4 # (int) マスクのダウンサンプル比（セグメントトレーニング専用）
+# 分類
+dropout: 0.0 # (float) ドロップアウト正則化を使用するかどうか（分類トレーニング専用）
+
+# 検証/テスト設定 ------------------------------------------------------------------------------------------------------
+val: True # (bool) 訓練中に検証/テストを行うかどうか
+split: val # (str) 検証に使用するデータセットの分割。例: 'val', 'test', 'train'
+save_json: False # (bool) 結果をJSONファイルに保存するかどうか
+save_hybrid: False # (bool) ラベルと追加予測を含むハイブリッドバージョンのラベルを保存するかどうか
+conf: # (float, 任意) 検出のためのオブジェクト信頼度のしきい値（デフォルトは0.25 predict、0.001 val）
+iou: 0.7 # (float) NMSのためのIoU（Intersection over Union）のしきい値
+max_det: 300 # (int) 1枚の画像あたりの最大検出数
+half: False # (bool) 半精度（FP16）を使用するかどうか
+dnn: False # (bool) ONNX推論にOpenCV DNNを使用するかどうか
+plots: True # (bool) 訓練/検証中にプロットや画像を保存するかどうか
+
+# 予測設定 -------------------------------------------------------------------------------------------------------------
+source: # (str, 任意) 画像またはビデオのソースディレクトリ
+vid_stride: 1 # (int) ビデオのフレームレートの間隔
+stream_buffer: False # (bool) ストリーミングフレームをバッファするか、最新のフレームを返すか
+visualize: False # (bool) モデルの特徴を視覚化するかどうか
+augment: False # (bool) 予測ソースに画像増強を適用するか
+agnostic_nms: False # (bool) クラスに依存しないNMSを使用するかどうか
+classes: # (int | list[int], 任意) クラスで結果をフィルタリング。例: classes=0、またはclasses=[0,2,3]
+retina_masks: False # (bool) 高解像度のセグメンテーションマスクを使用するかどうか
+embed: # (list[int], 任意) 指定したレイヤーから特徴ベクトル/埋め込みを返す
+
+# 可視化設定 -----------------------------------------------------------------------------------------------------------
+show: False # (bool) 環境が許す場合、予測された画像やビデオを表示するかどうか
+save_frames: False # (bool) 予測されたビデオフレームを個別に保存するかどうか
+save_txt: False # (bool) 結果を .txt ファイルとして保存するか
+save_conf: False # (bool) 信頼度スコア付きで結果を保存するか
+save_crop: False # (bool) 結果付きの切り抜き画像を保存するか
+show_labels: True # (bool) 予測ラベル（例: 'person'）を表示するか
+show_conf: True # (bool) 予測信頼度（例: '0.99'）を表示するか
+show_boxes: True # (bool) 予測ボックスを表示するか
+line_width: # (int, 任意) バウンディングボックスの線幅。Noneの場合、画像サイズに基づいてスケーリング
+
+# エクスポート設定 ------------------------------------------------------------------------------------------------------
+format: torchscript # (str) エクスポート先の形式。詳細は https://docs.ultralytics.com/modes/export/#export-formats を参照
+keras: False # (bool) Kerasを使用するかどうか
+optimize: False # (bool) TorchScriptのモバイル最適化
+int8: False # (bool) CoreML/TFのINT8量子化
+dynamic: False # (bool) ONNX/TF/TensorRTの動的軸
+simplify: False # (bool) ONNXモデルを`onnxslim`で簡略化
+opset: # (int, 任意) ONNXのopsetバージョン
+workspace: 4 # (int) TensorRTのワークスペースサイズ（GB）
+nms: False # (bool) CoreMLにNMS（非最大抑制）を追加するかどうか
+
+# ハイパーパラメータ設定 ------------------------------------------------------------------------------------------------
+lr0: 0.01 # (float) 初期学習率（SGD=1E-2, Adam=1E-3）
+lrf: 0.01 # (float) 最終学習率（lr0 * lrf）
+momentum: 0.937 # (float) SGDのモメンタム/Adamのbeta1
+weight_decay: 0.0005 # (float) オプティマイザの重み減衰（5e-4）
+warmup_epochs: 3.0 # (float) ウォームアップのエポック数（小数可）
+warmup_momentum: 0.8 # (float) ウォームアップ時の初期モメンタム
+warmup_bias_lr: 0.1 # (float) ウォームアップ時の初期バイアス学習率
+box: 7.5 # (float) ボックス損失の増加率
+cls: 0.5 # (float) クラス損失の増加率（ピクセルに比例）
+dfl: 1.5 # (float) dfl損失の増加率
+pose: 12.0 # (float) ポーズ損失の増加率
+kobj: 1.0 # (float) キーポイントオブジェクト損失の増加率
+label_smoothing: 0.0 # (float) ラベルスムージングの割合
+nbs: 256 # (int) 名目上のバッチサイズ
+hsv_h: 0.015 # (float) 画像のHSV-色相増強（割合）
+hsv_s: 0.7 # (float) 画像のHSV-彩度増強（割合）
+hsv_v: 0.4 # (float) 画像のHSV-明度増強（割合）
+degrees: 0.0 # (float) 画像の回転（±度）
+translate: 0.1 # (float) 画像の平行移動（±割合）
+scale: 0.5 # (float) 画像のスケール（±増加率）
+shear: 0.0 # (float) 画像のシアー（±度）
+perspective: 0.0 # (float) 画像の透視変換（±割合、範囲0-0.001）
+flipud: 0.0 # (float) 画像の上下反転（確率）
+fliplr: 0.5 # (float) 画像の左右反転（確率）
+bgr: 0.0 # (float) 画像チャネルのBGR（確率）
+mosaic: 1.0 # (float) 画像モザイクの確率
+mixup: 0.0 # (float) 画像ミックスアップの確率
+copy_paste: 0.0 # (float) セグメントのコピー＆ペーストの確率
+auto_augment: randaugment # (str) 分類のための自動増強ポリシー（randaugment, autoaugment, augmix）
+erasing: 0.4 # (float) 分類トレーニング時のランダム消去の確率（0-1）
+crop_fraction: 1.0 # (float) 分類評価/推論用の画像クロップ割合（0-1）
+
+# カスタム設定 ---------------------------------------------------------------------------------------------------------
+cfg: # (str, 任意) defaults.yamlを上書きするための設定ファイルパス
+
+# トラッカー設定 --------------------------------------------------------------------------------------------------------
+tracker: botsort.yaml # (str) トラッカーの種類。選択肢=[botsort.yaml, bytetrack.yaml]
