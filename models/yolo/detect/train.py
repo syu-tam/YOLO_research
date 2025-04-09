@@ -88,6 +88,7 @@ class DetectionTrainer(BaseTrainer):
     def get_validator(self):
         # YOLOモデル検証用のDetectionValidatorを返します。
         self.loss_names = "box_loss", "cls_loss", "dfl_loss" , "  feature_loss" # 損失名を設定
+        #self.loss_names = "box_loss", "cls_loss", "dfl_loss" 
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )  # DetectionValidatorを返す

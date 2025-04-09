@@ -332,7 +332,6 @@ class DetectionModel(BaseModel):
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """Forward pass through model."""
         y, dt = [], []
-
         for i, m in enumerate(self.model):
             if isinstance(m, Detectv2):
                 head_pre_pan_feats = [y[idx] for idx in self.feature_maps['indices']['pre_pan']]
@@ -402,24 +401,6 @@ class DetectionModel(BaseModel):
             return E2EDetectLoss(self)  # One2One Matching (E2E YOLO)。One2Oneマッチング（E2E YOLO）
         else:  # 通常の場合
             return v8DetectionLoss(self)  # 通常の YOLO 損失関数
-        
-    @property
-    def epoch(self):
-        return DetectionModel._epoch
-
-    @epoch.setter
-    def epoch(self, value):
-        DetectionModel._epoch = value
-
-    @property
-    def total_epochs(self):
-        return DetectionModel._total_epochs
-
-    @total_epochs.setter
-    def total_epochs(self,value):
-        DetectionModel._total_epochs = value
-
-
 
 class Ensemble(nn.ModuleList):
     """Ensemble of models."""

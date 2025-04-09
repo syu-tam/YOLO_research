@@ -121,6 +121,22 @@ class BboxLoss(nn.Module):
 
         return loss_iou, loss_dfl
 
+class PANFeatureLoss(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss(reduction='mean')
+        self.feature_weights = [1.5, 1.0, 0.5]
+
+    def forward(self, pre_pan_features, post_pan_features):
+        pan_loss = 0.0
+        with autocast(enabled=False):  # 自動混合精度 (AMP) を適用しない
+            for i, (pre, post) in enumerate(zip(pre_pan_features, post_pan_features)):
+                loss = self.mse(pre, post)*self.feature_weights[i]
+                pan_loss += loss
+        return pan_loss
+    
+
 class E2EDetectLoss:
     """Criterion class for computing training losses."""
     # トレーニング損失を計算するための基準クラス。
@@ -130,6 +146,11 @@ class E2EDetectLoss:
         # 提供されたモデルを使用して、1対多および1対1の検出損失でE2EDetectLossを初期化します。
         self.one2many = v8DetectionLoss(model, tal_topk=10, use_pan_loss = True)  # 1対多の損失を初期化
         self.one2one = v8DetectionLoss(model, tal_topk=10, use_pan_loss = False)  # 1対1の損失を初期化
+        
+        # 蒸留用のパラメータ
+        self.temperature = 1.0
+        self.alpha_cls = 0.5  # クラス分類の蒸留重み
+        self.alpha_dfl = 0.5  # DFL分布の蒸留重み
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
@@ -138,24 +159,58 @@ class E2EDetectLoss:
         one2many = preds["one2many"]  # one2manyを取得
         loss_one2many = self.one2many(one2many, batch)  # 1対多の損失を計算
         one2one = preds["one2one"]  # one2oneを取得
-        loss_one2one = self.one2one(one2one, batch)  # 1対1の損失を計算
+        loss_one2one = self.one2one(one2one, batch) # 1対1の損失を計算 
+        
+        # # 蒸留損失の計算 ここから------------------------------------
+        distill_loss = 0.25 * self._compute_distillation_loss(one2many, one2one) 
+        
+        # loss_one2many[1] の4番目に distill_loss を加える
+        stats_tensor = loss_one2many[1].clone().detach()  # 元のテンソルを複製（in-place操作を避ける）
+        stats_tensor[3] += distill_loss.clone().detach()  # 4番目の要素に加算
+        total_loss = (loss_one2many[0] + loss_one2one[0] + distill_loss)
+        return total_loss, stats_tensor + loss_one2one[1]
+        # 蒸留損失の計算 ここまで------------------------------------
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1] # 損失を返す
-
-class PANFeatureLoss(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.mse = nn.MSELoss(reduction='mean')
-        self.feature_weights = [3.0, 2.0, 1.0]
-
-    def forward(self, pre_pan_features, post_pan_features):
-        pan_loss = 0.0
-        with autocast(enabled=False):  # 自動混合精度 (AMP) を適用
-            for i, (pre, post) in enumerate(zip(pre_pan_features, post_pan_features)):
-                loss = self.mse(pre, post)*self.feature_weights[i]
-                pan_loss += loss
-        return pan_loss
     
+    def _compute_distillation_loss(self, teacher_preds, student_preds):
+        """クラス分類とDFL分布の蒸留損失を計算"""
+        kl_loss = torch.tensor(0., device=self.one2many.device)
+        teacher_preds = torch.cat([xi.view(teacher_preds[0].shape[0], self.one2many.no, -1) for xi in teacher_preds ], 2)
+        student_preds = torch.cat([xi.view(student_preds[0].shape[0], self.one2one.no, -1) for xi in student_preds], 2)    
+        for t_feat, s_feat in zip(teacher_preds, student_preds):
+            
+            # 予測を分離（DFLとクラス分類）
+            t_dfl, t_cls = t_feat.split((self.one2many.reg_max * 4, self.one2many.nc), 0)
+            s_dfl, s_cls = s_feat.split((self.one2many.reg_max * 4, self.one2many.nc), 0)
+            
+            # クラス分類の蒸留
+            t_cls_prob = (t_cls / self.temperature).softmax(dim=1)
+            s_cls_prob = (s_cls / self.temperature).log_softmax(dim=1)
+            cls_kld = F.kl_div(
+                s_cls_prob, 
+                t_cls_prob, 
+                reduction='batchmean'
+            ) * (self.temperature ** 2)
+
+            # DFL分布の蒸留
+            t_dfl = t_dfl.view(-1, 4, self.one2many.reg_max)
+            s_dfl = s_dfl.view(-1, 4, self.one2many.reg_max)
+            
+            t_dfl_prob = (t_dfl / self.temperature).softmax(dim=2)
+            s_dfl_prob = (s_dfl / self.temperature).log_softmax(dim=2)
+            dfl_kld = F.kl_div(
+                s_dfl_prob, 
+                t_dfl_prob, 
+                reduction='batchmean'
+            ) * (self.temperature ** 2)
+
+            # 重み付け合算
+            kl_loss += self.alpha_cls * cls_kld + self.alpha_dfl * dfl_kld
+
+        return kl_loss
+    
+    
+
 class v8DetectionLoss:
     """Criterion class for computing training losses."""
     # トレーニング損失を計算するための基準クラス。
@@ -177,16 +232,14 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1  # DFLの使用
         self.use_pan_loss = use_pan_loss
-        
-        self.initial_topk = tal_topk  # 初期値を保存
-        self.current_topk = tal_topk  # 現在の値を追跡
+    
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)  # タスクアライメントアサインを初期化
         self.bbox_loss = BboxLoss(m.reg_max).to(device)  # バウンディングボックス損失を初期化
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)  # プロジェクトを初期化
-        self.model=model  # モデルを初期化
         
-        self.pan_loss = PANFeatureLoss().to(device)  # PAN特徴マップ損失を追加
-        
+        # self.pan_loss = PANFeatureLoss().to(device)  # PAN特徴マップ損失を追加
+        # self.attn_loss = SquaredSumAttentionTransferLoss().to(device)
+        # self.channel_dist = ChannelWiseDistillation(temperature=2.0).to(device)
         
         if isinstance(model.model[-1], Detectv2):
             if tal_topk == 1:
@@ -272,18 +325,119 @@ class v8DetectionLoss:
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
-        # PAN特徴マップ損失の計算を追加
-        if hasattr(self.model.model[-1], 'feature_maps') and self.use_pan_loss == True:
-            pre_features = self.model.model[-1].feature_maps['pre_pan']
-            post_features = self.model.model[-1].feature_maps['post_pan']
-            if pre_features and post_features:
-                loss[3] = self.pan_loss(pre_features, post_features)
+        # # PAN特徴マップ損失の計算を追加
+        # if hasattr(self.model.model[-1], 'feature_maps') and self.use_pan_loss == True:
+        #     pre_features = self.model.model[-1].feature_maps['pre_pan']
+        #     post_features = self.model.model[-1].feature_maps['post_pan']
+        #     if pre_features and post_features:
+        #         #loss[3] = self.channel_dist(pre_features, post_features)
+        #         #loss[3] = self.attn_loss(pre_features, post_features)
+        #         loss[3] = self.pan_loss(pre_features, post_features)
         
 
         loss[0] *= self.hyp.box  # box gain。ボックスゲイン
         loss[1] *= self.hyp.cls  # cls gain。clsゲイン
         loss[2] *= self.hyp.dfl  # dfl gain。dflゲイン
-        loss[3] *= 7.50 # PAN損失の重みを適用
+        #loss[3] *= 0 # PAN損失の重みを適用
         
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)。損失を返す
 
+class ChannelWiseDistillation(nn.Module):
+    def __init__(self, temperature=1.0):
+        """
+        Channel-wise Distillation Loss の実装
+        - 各チャンネルの特徴マップを確率分布化し、KL ダイバージェンスを計算
+        """
+        super().__init__()
+        self.temperature = temperature  # 温度パラメータ T
+
+    def forward(self, teacher_features, student_features):
+        """
+        教師 (Teacher) と生徒 (Student) の特徴マップを入力し、スケールごとの KL ダイバージェンスを計算
+
+        Args:
+            teacher_features (list of torch.Tensor): 教師の特徴マップ [(B, C1, H1, W1), (B, C2, H2, W2), (B, C3, H3, W3)]
+            student_features (list of torch.Tensor): 生徒の特徴マップ [(B, C1', H1', W1'), (B, C2', H2', W2'), (B, C3', H3', W3')]
+
+        Returns:
+            torch.Tensor: スケールごとの平均 KL ダイバージェンス損失
+        """
+        total_loss = 0.0
+        num_scales = len(teacher_features)  # スケールの数（通常3）
+
+        for i, (t_feat, s_feat) in enumerate(zip(teacher_features, student_features)):
+            # 各スケールの特徴マップのサイズを取得
+            B, C, H, W = t_feat.shape
+
+            # Softmax による確率分布化（各チャンネルごとに H×W に対して）
+            t_prob = F.softmax(t_feat.view(B, C, -1) / self.temperature, dim=-1).view(B, C, H, W)
+            s_prob = F.softmax(s_feat.view(B, C, -1) / self.temperature, dim=-1).view(B, C, H, W)
+
+            # KLダイバージェンスの計算（バッチ平均）
+            loss = F.kl_div(s_prob.log(), t_prob, reduction='batchmean')
+
+            # 論文の式通りに T^2 を適用
+            total_loss += ((self.temperature ** 2) / C) * loss
+
+        return total_loss   # スケールごとの平均損失を返す
+
+class SquaredSumAttentionTransferLoss(nn.Module):
+    """
+    論文と同様の手法で2乗和のAttention Transfer Lossを計算するクラスです。
+    
+    各特徴マップ（pre_features, post_features）について、
+    チャネル方向の2乗和をとって空間的注意マップを生成し、各サンプルごとに
+    ベクトル化・l2正規化します。その後、教師と生徒の正規化済み注意マップの
+    L2距離（ノルム）を計算して合計します。
+    
+    Attributes:
+        loss_weight (float): 損失に乗じる重み（β相当、デフォルトは1.0）
+    """
+    def __init__(self, loss_weight: float = 1.0):
+        super().__init__()
+        self.loss_weight = loss_weight
+
+    def forward(self, teacher_features, student_features):
+        """
+        教師と生徒の特徴マップリストからAttention Transfer Lossを計算します。
+        
+        Args:
+            teacher_features (list of torch.Tensor): 教師側の特徴マップリスト。各テンソルは形状 (B, C, H, W)。
+            student_features (list of torch.Tensor): 生徒側の特徴マップリスト。各テンソルは形状 (B, C, H, W)。
+        
+        Returns:
+            torch.Tensor: 損失値（スカラー）
+        """
+        total_loss = 0.0
+        with autocast(enabled=True):
+            # 各層/スケールごとに注意マップを計算し、L2距離を算出
+            for i, (t_feat, s_feat) in enumerate(zip(teacher_features, student_features)):
+                # F^2_sumによる注意マップの計算: チャネル方向の2乗和 → (B, H, W)
+                # その後、フラット化して (B, H*W) に、さらにl2正規化
+                t_att = self._compute_attention(t_feat)
+                s_att = self._compute_attention(s_feat)
+                # 各サンプルごとにL2ノルム（p=2）の差を計算し、バッチ平均
+                layer_loss = (s_att - t_att).norm(p=2, dim=1).mean()
+                total_loss += layer_loss
+        return self.loss_weight * total_loss
+
+    def _compute_attention(self, feat):
+        """
+        特徴マップから注意マップを計算します。
+        
+        入力 feat は形状 (B, C, H, W) とし、チャネル方向の2乗和をとって (B, H, W) の
+        注意マップを生成、その後 (B, H*W) にフラット化し、各サンプルごとにl2正規化します。
+        
+        Args:
+            feat (torch.Tensor): 特徴マップ、形状 (B, C, H, W)
+        
+        Returns:
+            torch.Tensor: l2正規化された注意マップ、形状 (B, H*W)
+        """
+        # チャネルごとの2乗和（F^2_sum）
+        att = (feat ** 2).sum(dim=1)  # (B, H, W)
+        # 空間次元をフラット化
+        att = att.view(att.size(0), -1)  # (B, H*W)
+        # 各サンプルごとにl2正規化
+        att = F.normalize(att, p=2, dim=1)
+        return att

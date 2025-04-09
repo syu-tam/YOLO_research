@@ -166,6 +166,7 @@ class Detect(nn.Module):
         scores, index = scores.flatten(1).topk(min(max_det, anchors))  # スコアとインデックスを取得
         i = torch.arange(batch_size)[..., None]  # batch indices。バッチインデックス
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)  # 結果を返す
+    
 
 
 class v10Detect(Detect):
@@ -269,6 +270,8 @@ class Detectv2(nn.Module):
         }  
         
         self.skip_nms = False
+
+        self.is_predict=None
        
     
     def forward(self, x):
@@ -279,24 +282,20 @@ class Detectv2(nn.Module):
         訓練時は各ヘッドの中間出力を返し、推論時は後処理した検出結果を返します。
         """
 
-        # if not isinstance(x, (list, tuple)) or len(x) != 2:
-        #     raise ValueError("Input must be a list of [head_a_features, head_b_features]")
+        if not isinstance(x, (list, tuple)) or len(x) != 2:
+            raise ValueError("Input must be a list of [head_a_features, head_b_features]")
+    
         head_pre_pan_feats, head_post_pan_feats = x
-
-        head_pre_pan_feats_detached = [feats for feats in head_pre_pan_feats]
-
         
         head_pre_pan_feats_aligned = [
-            self.align_conv[i](head_pre_pan_feats_detached[i]) for i in range(self.nl)
+            self.align_conv[i](head_pre_pan_feats[i]) for i in range(self.nl)
         ]
         
         self.feature_maps['pre_pan'] = list(feats for feats in head_pre_pan_feats_aligned)
         self.feature_maps['post_pan'] = list(feats for feats in head_post_pan_feats)
-    
-        a_x_detach = [a_xi for a_xi in head_pre_pan_feats_aligned]  # 入力を分離
 
         one2one = [
-            torch.cat((self.one2one_cv2[i](a_x_detach[i]), self.one2one_cv3[i](a_x_detach[i])), 1) for i in range(self.nl)
+            torch.cat((self.one2one_cv2[i](head_pre_pan_feats_aligned[i]), self.one2one_cv3[i](head_pre_pan_feats_aligned[i])), 1) for i in range(self.nl)
         ]  # one2oneを計算
 
         one2many = [
@@ -304,9 +303,9 @@ class Detectv2(nn.Module):
         ]
         # 特徴を連結
         
-        
         if self.training:  # Training path。トレーニングパスの場合
             return {"one2many": one2many, "one2one": one2one}  # one2manyとone2oneを返す
+        
 
         y = self._inference(one2many)  # 推論を実行
         if self.skip_nms is True:

@@ -88,9 +88,6 @@ class BaseValidator:
             self.args.half = self.device.type != "cpu" and trainer.amp  # 半精度を設定
             model = trainer.ema.ema or trainer.model  # モデルを設定
             model = model.half() if self.args.half else model.float()  # 半精度または浮動小数点に変換
-            if hasattr(model.model[-1], 'current_tal_topk'):  # tal_topkがある場合
-                current_tal_topk = model.model[-1].current_tal_topk  # current_tal_topkを取得
-                model.model[-1].current_tal_topk = current_tal_topk  # current_tal_topkを設定
             # self.model = model
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)  # 損失を初期化
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)  # プロットを設定
@@ -106,6 +103,7 @@ class BaseValidator:
                 data=self.args.data,  # データを設定
                 fp16=self.args.half,  # 半精度を設定
             )
+
             # self.model = model
             self.device = model.device  # update device。デバイスを更新
             self.args.half = model.fp16  # update half。半精度を更新
@@ -130,10 +128,11 @@ class BaseValidator:
                 self.args.rect = False  # アスペクト比固定を無効化
             self.stride = model.stride  # used in get_dataloader() for padding。パディングに使用されるストライド
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)  # データローダーを取得
-
+            #print(dir(model.model.model.modules))
+            model.model.is_predict = True
             model.eval()  # 評価モードを設定
             model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup。ウォームアップ
-
+        #model.model[-1].is_predict =  not self.training 
         self.run_callbacks("on_val_start")  # 検証開始時にコールバックを実行
         dt = (  # 時間計測器を初期化
             Profile(device=self.device),
