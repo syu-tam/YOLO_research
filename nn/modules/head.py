@@ -238,7 +238,6 @@ class Detectv2(nn.Module):
         "ch[0]とch[1]のチャネル数を一致させるためのconv層"
         self.align_conv = nn.ModuleList(
            nn.Conv2d(input_ch, out_ch, kernel_size=1, stride=1)
-           #Conv_withoutBN(input_ch, out_ch, 1) 
            for input_ch, out_ch in zip(ch[0],ch[1])
         )
         self.cv2 = nn.ModuleList(
@@ -270,10 +269,20 @@ class Detectv2(nn.Module):
         }  
         
         self.skip_nms = False
+        
+        self._is_predict = False  # 推論モードフラグの初期化
 
-        self.is_predict=None
-       
-    
+        
+    @property
+    def is_predict(self):
+        """推論モードかどうかを返す"""
+        return self._is_predict
+
+    @is_predict.setter
+    def is_predict(self, value):
+        """推論モードを設定する"""
+        self._is_predict = value
+
     def forward(self, x):
         """
         入力 x はリストまたはタプルで、以下の形式を期待します:
@@ -281,26 +290,30 @@ class Detectv2(nn.Module):
         各 head_x_features は、例: [feat1, feat2, feat3] (各 feat は [B, C, H, W] のテンソル)。
         訓練時は各ヘッドの中間出力を返し、推論時は後処理した検出結果を返します。
         """
-
         if not isinstance(x, (list, tuple)) or len(x) != 2:
             raise ValueError("Input must be a list of [head_a_features, head_b_features]")
     
-        head_pre_pan_feats, head_post_pan_feats = x
+        pre_pan_feats, post_pan_feats = x
         
-        head_pre_pan_feats_aligned = [
-            self.align_conv[i](head_pre_pan_feats[i]) for i in range(self.nl)
+        pre_pan_feats_aligned = [
+            self.align_conv[i](pre_pan_feats[i]) for i in range(self.nl)
         ]
         
-        self.feature_maps['pre_pan'] = list(feats for feats in head_pre_pan_feats_aligned)
-        self.feature_maps['post_pan'] = list(feats for feats in head_post_pan_feats)
-
-        one2one = [
-            torch.cat((self.one2one_cv2[i](head_pre_pan_feats_aligned[i]), self.one2one_cv3[i](head_pre_pan_feats_aligned[i])), 1) for i in range(self.nl)
-        ]  # one2oneを計算
-
+        self.feature_maps['pre_pan'] = list(pre_pan_feats_aligned)
+        self.feature_maps['post_pan'] = list(post_pan_feats)
+        
         one2many = [
-            torch.cat((self.cv2[i](head_post_pan_feats[i]), self.cv3[i](head_post_pan_feats[i])), 1) for i in range(self.nl)
+            torch.cat((self.cv2[i](post_pan_feats[i]), self.cv3[i](post_pan_feats[i])), 1) for i in range(self.nl)
         ]
+        
+
+        #if self.is_predict == False:
+        one2one = [
+                    torch.cat((self.one2one_cv2[i](pre_pan_feats_aligned[i]), self.one2one_cv3[i](pre_pan_feats_aligned[i])), 1) for i in range(self.nl)
+                ]  # one2oneを計算
+        # else:
+        #     one2one = None
+        
         # 特徴を連結
         
         if self.training:  # Training path。トレーニングパスの場合
@@ -381,6 +394,6 @@ class Detectv2(nn.Module):
         i = torch.arange(batch_size)[..., None]  # batch indices。バッチインデックス
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)  # 結果を返す
 
-    
+
 
 

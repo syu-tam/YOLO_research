@@ -276,6 +276,7 @@ class DetectionModel(BaseModel):
     
     def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True):
         super().__init__()
+        self.is_predict = False  # モデルの予測フラグを設定
         self.feature_maps = {
             'indices': {
                 'pre_pan': [4, 6, 10],  # P3, P4, P5のインデックス
@@ -327,26 +328,29 @@ class DetectionModel(BaseModel):
         if verbose:  # 詳細モードの場合
             self.info()  # 情報を表示
             LOGGER.info("")  # 空白行を出力
-            
+    
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
-        """Forward pass through model."""
-        y, dt = [], []
+        """Forward pass through model with improved feature map management."""
+        y = []
+        feature_manager = FeatureMapManager()
+        
         for i, m in enumerate(self.model):
             if isinstance(m, Detectv2):
-                head_pre_pan_feats = [y[idx] for idx in self.feature_maps['indices']['pre_pan']]
-                head_post_pan_feats = [y[idx] for idx in self.feature_maps['indices']['post_pan']]
-                x = [head_pre_pan_feats, head_post_pan_feats]
-                            
-
+                m.is_predict =  self.is_predict  # モデルの予測フラグを設定
+                x = [feature_manager.pre_pan_features, feature_manager.post_pan_features]
             elif m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
-            # 順伝播
+            # Forward propagation
             x = m(x)
             
-            y.append(x if m.i in (self.save or self.feature_maps['indices']['pre_pan'] or self.feature_maps['indices']['post_pan']) else None)
-            
+            # Store feature maps if needed
+            if feature_manager.should_save_feature(m.i):
+                feature_manager.store_feature(m.i, x)
+                
+            y.append(x if m.i in self.save else None)
+        
         return x
     
     def _predict_augment(self, x):
@@ -473,7 +477,22 @@ def temporary_modules(modules=None, attributes=None):
             if old in sys.modules:
                 del sys.modules[old]
 
-
+class FeatureMapManager:
+    def __init__(self):
+        self.pre_pan_indices = set([4, 6, 10])  # P3, P4, P5のインデックス
+        self.post_pan_indices = set([16, 19, 22])  # 1x1 Conv層のインデックス
+        self.pre_pan_features = []
+        self.post_pan_features = []
+        
+    def should_save_feature(self, index):
+        return index in self.pre_pan_indices or index in self.post_pan_indices
+        
+    def store_feature(self, index, feature):
+        if index in self.pre_pan_indices:
+            self.pre_pan_features.append(feature)
+        elif index in self.post_pan_indices:
+            self.post_pan_features.append(feature)
+            
 class SafeClass:
     """A placeholder class to replace unknown classes during unpickling."""
 
@@ -727,7 +746,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, ImagePoolingAttn, v10Detect,Detectv2}:
+        elif m in {Detect, ImagePoolingAttn, v10Detect, Detectv2}:
             if isinstance(f, list) and f and isinstance(f[0], list):
                 args.append([[ch[x] for x in sub_f] for sub_f in f])
             else:
@@ -759,9 +778,6 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         else:
             if i != 0:
                 save.append(f % i)
-    # i==0 の場合は保存しない
-
-
 
         layers.append(m_)  # モジュール追加
         if i == 0:

@@ -130,6 +130,7 @@ class AutoBackend(nn.Module):
 
         # Set device
         cuda = torch.cuda.is_available() and device.type != "cpu"  # use CUDA
+
         if cuda and not any([nn_module, pt, jit, engine, onnx]):  # GPU dataloader formats
             device = torch.device("cpu")
             cuda = False
@@ -464,7 +465,6 @@ class AutoBackend(nn.Module):
         # PyTorch
         if self.pt or self.nn_module:
             y = self.model(im, augment=augment, visualize=visualize, embed=embed)
-
         # TorchScript
         elif self.jit:
             y = self.model(im)

@@ -22,7 +22,7 @@ data = "VOC.yaml"
 batch = 64
 epochs = 500
 patience = 50
-is_wandb = False
+is_wandb = True
 
 # 保存先設定
 train_project = os.path.join(f"result/v{method.replace('yolov', '')}/train/{model_size}")

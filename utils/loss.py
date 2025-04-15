@@ -129,10 +129,10 @@ class PANFeatureLoss(nn.Module):
         self.feature_weights = [1.5, 1.0, 0.5]
 
     def forward(self, pre_pan_features, post_pan_features):
-        pan_loss = 0.0
+        pan_loss = torch.tensor(0.0, device=pre_pan_features[0].device)
         with autocast(enabled=False):  # 自動混合精度 (AMP) を適用しない
             for i, (pre, post) in enumerate(zip(pre_pan_features, post_pan_features)):
-                loss = self.mse(pre, post)*self.feature_weights[i]
+                loss = self.mse(pre, post) * self.feature_weights[i]
                 pan_loss += loss
         return pan_loss
     
@@ -161,7 +161,7 @@ class E2EDetectLoss:
         one2one = preds["one2one"]  # one2oneを取得
         loss_one2one = self.one2one(one2one, batch) # 1対1の損失を計算 
         
-        # # 蒸留損失の計算 ここから------------------------------------
+         # 蒸留損失の計算 ここから------------------------------------
         distill_loss = 0.25 * self._compute_distillation_loss(one2many, one2one) 
         
         # loss_one2many[1] の4番目に distill_loss を加える
@@ -236,14 +236,16 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)  # タスクアライメントアサインを初期化
         self.bbox_loss = BboxLoss(m.reg_max).to(device)  # バウンディングボックス損失を初期化
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)  # プロジェクトを初期化
+
+        self.model = model
         
-        # self.pan_loss = PANFeatureLoss().to(device)  # PAN特徴マップ損失を追加
+        self.pan_loss = PANFeatureLoss().to(device)  # PAN特徴マップ損失を追加
         # self.attn_loss = SquaredSumAttentionTransferLoss().to(device)
         # self.channel_dist = ChannelWiseDistillation(temperature=2.0).to(device)
+
         
-        if isinstance(model.model[-1], Detectv2):
-            if tal_topk == 1:
-                model.model[-1].skip_nms = True  # Detectv2にtal_topkを設定
+        if isinstance(model.model[-1], Detectv2) and tal_topk == 1:
+            model.model[-1].skip_nms = True  # Detectv2にtal_topkを設定
 
 
     def preprocess(self, targets, batch_size, scale_tensor):
@@ -325,20 +327,20 @@ class v8DetectionLoss:
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
-        # # PAN特徴マップ損失の計算を追加
-        # if hasattr(self.model.model[-1], 'feature_maps') and self.use_pan_loss == True:
-        #     pre_features = self.model.model[-1].feature_maps['pre_pan']
-        #     post_features = self.model.model[-1].feature_maps['post_pan']
-        #     if pre_features and post_features:
-        #         #loss[3] = self.channel_dist(pre_features, post_features)
-        #         #loss[3] = self.attn_loss(pre_features, post_features)
-        #         loss[3] = self.pan_loss(pre_features, post_features)
+        # PAN特徴マップ損失の計算を追加
+        if hasattr(self.model.model[-1], 'feature_maps') and self.use_pan_loss == True:
+            pre_features = self.model.model[-1].feature_maps['pre_pan']
+            post_features = self.model.model[-1].feature_maps['post_pan']
+            if pre_features and post_features:
+                #loss[3] = self.channel_dist(pre_features, post_features)
+                #loss[3] = self.attn_loss(pre_features, post_features)
+                loss[3] = self.pan_loss(pre_features, post_features)
         
 
         loss[0] *= self.hyp.box  # box gain。ボックスゲイン
         loss[1] *= self.hyp.cls  # cls gain。clsゲイン
         loss[2] *= self.hyp.dfl  # dfl gain。dflゲイン
-        #loss[3] *= 0 # PAN損失の重みを適用
+        loss[3] *= 7.5 # PAN損失の重みを適用
         
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)。損失を返す
 

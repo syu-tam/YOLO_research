@@ -128,11 +128,12 @@ class BaseValidator:
                 self.args.rect = False  # アスペクト比固定を無効化
             self.stride = model.stride  # used in get_dataloader() for padding。パディングに使用されるストライド
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)  # データローダーを取得
-            #print(dir(model.model.model.modules))
-            model.model.is_predict = True
+
             model.eval()  # 評価モードを設定
             model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup。ウォームアップ
-        #model.model[-1].is_predict =  not self.training 
+            
+            model.model.is_predict  = True  # モデルを予測モードに設定
+            
         self.run_callbacks("on_val_start")  # 検証開始時にコールバックを実行
         dt = (  # 時間計測器を初期化
             Profile(device=self.device),
