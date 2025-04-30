@@ -96,12 +96,15 @@ class Tuner:
             "flipud": (0.0, 1.0),  # image flip up-down (probability)
             "fliplr": (0.0, 1.0),  # image flip left-right (probability)
             "bgr": (0.0, 1.0),  # image channel bgr (probability)
-            "mosaic": (0.0, 1.0),  # image mixup (probability)
+            "mosaic": (0.0, 1.0),  # image mosaic (probability)
             "mixup": (0.0, 1.0),  # image mixup (probability)
+            "cutmix": (0.0, 1.0),  # image cutmix (probability)
             "copy_paste": (0.0, 1.0),  # segment copy-paste (probability)
         }
         self.args = get_cfg(overrides=args)
-        self.tune_dir = get_save_dir(self.args, name="tune")
+        self.args.exist_ok = self.args.resume  # resume w/ same tune_dir
+        self.tune_dir = get_save_dir(self.args, name=self.args.name or "tune")
+        self.args.name, self.args.exist_ok, self.args.resume = (None, False, False)  # reset to not affect training
         self.tune_csv = self.tune_dir / "tune_results.csv"
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
         self.prefix = colorstr("Tuner: ")
@@ -140,7 +143,7 @@ class Tuner:
             # Mutate
             r = np.random  # method
             r.seed(int(time.time()))
-            g = np.array([v[2] if len(v) == 3 else 1.0 for k, v in self.space.items()])  # gains 0-1
+            g = np.array([v[2] if len(v) == 3 else 1.0 for v in self.space.values()])  # gains 0-1
             ng = len(self.space)
             v = np.ones(ng)
             while all(v == 1):  # mutate until a change occurs (prevent duplicates)
@@ -179,7 +182,12 @@ class Tuner:
         t0 = time.time()
         best_save_dir, best_metrics = None, None
         (self.tune_dir / "weights").mkdir(parents=True, exist_ok=True)
-        for i in range(iterations):
+        start = 0
+        if self.tune_csv.exists():
+            x = np.loadtxt(self.tune_csv, ndmin=2, delimiter=",", skiprows=1)
+            start = x.shape[0]
+            LOGGER.info(f"{self.prefix}Resuming tuning run {self.tune_dir} from iteration {start + 1}...")
+        for i in range(start, iterations):
             # Mutate hyperparameters
             mutated_hyp = self._mutate()
             LOGGER.info(f"{self.prefix}Starting iteration {i + 1}/{iterations} with hyperparameters: {mutated_hyp}")
@@ -190,20 +198,21 @@ class Tuner:
             weights_dir = save_dir / "weights"
             try:
                 # Train YOLO model with mutated hyperparameters (run in subprocess to avoid dataloader hang)
-                cmd = ["yolo", "train", *(f"{k}={v}" for k, v in train_args.items())]
+                launch = [__import__("sys").executable, "-m", "ultralytics.cfg.__init__"]  # workaround yolo not found
+                cmd = [*launch, "train", *(f"{k}={v}" for k, v in train_args.items())]
                 return_code = subprocess.run(cmd, check=True).returncode
                 ckpt_file = weights_dir / ("best.pt" if (weights_dir / "best.pt").exists() else "last.pt")
                 metrics = torch.load(ckpt_file)["train_metrics"]
                 assert return_code == 0, "training failed"
 
             except Exception as e:
-                LOGGER.warning(f"WARNING ❌️ training failure for hyperparameter tuning iteration {i + 1}\n{e}")
+                LOGGER.error(f"training failure for hyperparameter tuning iteration {i + 1}\n{e}")
 
             # Save results and mutated_hyp to CSV
             fitness = metrics.get("fitness", 0.0)
             log_row = [round(fitness, 5)] + [mutated_hyp[k] for k in self.space.keys()]
             headers = "" if self.tune_csv.exists() else (",".join(["fitness"] + list(self.space.keys())) + "\n")
-            with open(self.tune_csv, "a") as f:
+            with open(self.tune_csv, "a", encoding="utf-8") as f:
                 f.write(headers + ",".join(map(str, log_row)) + "\n")
 
             # Get best results
@@ -224,12 +233,12 @@ class Tuner:
 
             # Save and print tune results
             header = (
-                f'{self.prefix}{i + 1}/{iterations} iterations complete ✅ ({time.time() - t0:.2f}s)\n'
-                f'{self.prefix}Results saved to {colorstr("bold", self.tune_dir)}\n'
-                f'{self.prefix}Best fitness={fitness[best_idx]} observed at iteration {best_idx + 1}\n'
-                f'{self.prefix}Best fitness metrics are {best_metrics}\n'
-                f'{self.prefix}Best fitness model is {best_save_dir}\n'
-                f'{self.prefix}Best fitness hyperparameters are printed below.\n'
+                f"{self.prefix}{i + 1}/{iterations} iterations complete ✅ ({time.time() - t0:.2f}s)\n"
+                f"{self.prefix}Results saved to {colorstr('bold', self.tune_dir)}\n"
+                f"{self.prefix}Best fitness={fitness[best_idx]} observed at iteration {best_idx + 1}\n"
+                f"{self.prefix}Best fitness metrics are {best_metrics}\n"
+                f"{self.prefix}Best fitness model is {best_save_dir}\n"
+                f"{self.prefix}Best fitness hyperparameters are printed below.\n"
             )
             LOGGER.info("\n" + header)
             data = {k: float(x[best_idx, i + 1]) for i, k in enumerate(self.space.keys())}

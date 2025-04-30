@@ -15,7 +15,7 @@ from utils import LOGGER, TQDM, checks, clean_url, emojis, is_online, url2file
 
 # Define Ultralytics GitHub assets maintained at https://github.com/ultralytics/assets
 GITHUB_ASSETS_REPO = "ultralytics/assets"
-GITHUB_ASSETS_NAMES = (
+GITHUB_ASSETS_NAMES = frozenset(
     [f"yolov8{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb", "-oiv7")]
     + [f"yolo11{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb")]
     + [f"yolov5{k}{resolution}u.pt" for k in "nsmlx" for resolution in ("", "6")]
@@ -31,7 +31,7 @@ GITHUB_ASSETS_NAMES = (
     + ["mobile_sam.pt"]
     + ["calibration_image_sample_data_20x128x128x3_float32.npy.zip"]
 )
-GITHUB_ASSETS_STEMS = [Path(k).stem for k in GITHUB_ASSETS_NAMES]
+GITHUB_ASSETS_STEMS = frozenset(k.rsplit(".", 1)[0] for k in GITHUB_ASSETS_NAMES)
 
 
 def is_url(url, check=False):
@@ -182,7 +182,7 @@ def unzip_file(file, path=None, exclude=(".DS_Store", "__MACOSX"), exist_ok=Fals
         # Check if destination directory already exists and contains files
         if path.exists() and any(path.iterdir()) and not exist_ok:
             # If it exists and is not empty, return the path without unzipping
-            LOGGER.warning(f"WARNING ⚠️ Skipping {file} unzip as destination directory {path} is not empty.")
+            LOGGER.warning(f"Skipping {file} unzip as destination directory {path} is not empty.")
             return path
 
         for f in TQDM(files, desc=f"Unzipping {file} to {Path(path).resolve()}...", unit="file", disable=not progress):
@@ -269,8 +269,7 @@ def get_google_drive_file_info(link):
         for k, v in response.cookies.items():
             if k.startswith("download_warning"):
                 drive_url += f"&confirm={v}"  # v is token
-        cd = response.headers.get("content-disposition")
-        if cd:
+        if cd := response.headers.get("content-disposition"):
             filename = re.findall('filename="(.+)"', cd)[0]
     return drive_url, filename
 
@@ -329,9 +328,10 @@ def safe_download(
         LOGGER.info(f"{desc}...")
         f.parent.mkdir(parents=True, exist_ok=True)  # make directory if missing
         check_disk_space(url, path=f.parent)
+        curl_installed = shutil.which("curl")
         for i in range(retry + 1):
             try:
-                if curl or i > 0:  # curl download with retry, continue
+                if (curl or i > 0) and curl_installed:  # curl download with retry, continue
                     s = "sS" * (not progress)  # silent
                     r = subprocess.run(["curl", "-#", f"-{s}L", url, "-o", f, "--retry", "3", "-C", "-"]).returncode
                     assert r == 0, f"Curl return value {r}"
@@ -362,7 +362,7 @@ def safe_download(
                     raise ConnectionError(emojis(f"❌  Download failure for {uri}. Environment is not online.")) from e
                 elif i >= retry:
                     raise ConnectionError(emojis(f"❌  Download failure for {uri}. Retry limit reached.")) from e
-                LOGGER.warning(f"⚠️ Download failure, retrying {i + 1}/{retry} {uri}...")
+                LOGGER.warning(f"Download failure, retrying {i + 1}/{retry} {uri}...")
 
     if unzip and f.exists() and f.suffix in {"", ".zip", ".tar", ".gz"}:
         from zipfile import is_zipfile
@@ -376,6 +376,7 @@ def safe_download(
         if delete:
             f.unlink()  # remove zip
         return unzip_dir
+    return f
 
 
 def get_github_assets(repo="ultralytics/assets", version="latest", retry=False):

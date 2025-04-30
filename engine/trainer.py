@@ -56,7 +56,8 @@ from utils.torch_utils import (  # PyTorchユーティリティ関数をイン�
     select_device,  # デバイスを選択
     strip_optimizer,  # オプティマイザを削除
     torch_distributed_zero_first,  # 分散トレーニング用のユーティリティ
-)
+    unset_deterministic,
+    )
 
 
 class BaseTrainer:
@@ -252,6 +253,7 @@ class BaseTrainer:
         )
         always_freeze_names = [".dfl"]  # always freeze these layers。常にこれらのレイヤーをフリーズ
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names  # フリーズするレイヤー名
+        self.freeze_layer_names = freeze_layer_names
         for k, v in self.model.named_parameters():  # モデルのパラメータを反復処理
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
             if any(x in k for x in freeze_layer_names):  # レイヤー名がフリーズリストに含まれている場合
@@ -286,12 +288,7 @@ class BaseTrainer:
 
         # Batch size
         if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size。シングルGPUの場合のみ、最適なバッチサイズを見積もる
-            self.args.batch = self.batch_size = check_train_batch_size(
-                model=self.model,
-                imgsz=self.args.imgsz,
-                amp=self.amp,
-                batch=self.batch_size,
-            )  # バッチサイズをチェック
+            self.args.batch = self.batch_size = self.auto_batch()
 
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)  # バッチサイズを計算
@@ -356,6 +353,7 @@ class BaseTrainer:
             self.model.epoch = epoch  # プロパティを通して_epochを更新
             self.model.total_epochs = self.epochs  # プロパティを通して_total_epochsを更新
             self.epoch = epoch  # エポックを設定
+            self.run_callbacks("on_train_epoch_start")
             
             with warnings.catch_warnings():  # 警告をキャッチ
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'。'optimizer.step（）の前にlr_scheduler.step（）が検出されました'を抑制
@@ -374,7 +372,6 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())  # 進行状況文字列を記録
                 pbar = TQDM(enumerate(self.train_loader), total=nb)  # TQDMプログレスバーを初期化
             self.tloss = None  # 合計損失をリセット
-
             for i, batch in pbar:  # バッチを反復処理
                 self.run_callbacks("on_train_batch_start")  # トレーニングバッチの開始時にコールバックを実行
                 # Warmup
@@ -393,7 +390,8 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):  # 自動混合精度を使用
                     batch = self.preprocess_batch(batch)  # バッチを前処理
-                    self.loss, self.loss_items = self.model(batch)  # モデルを適用
+                    loss, self.loss_items = self.model(batch)  # モデルを適用
+                    self.loss = loss.sum()
                     if RANK != -1:  # DDPトレーニングの場合
                         self.loss *= world_size  # 損失をスケール
                     self.tloss = (
@@ -468,7 +466,8 @@ class BaseTrainer:
                 self.scheduler.last_epoch = self.epoch  # do not move。移動しないでください
                 self.stop |= epoch >= self.epochs  # stop if exceeded epochs。エポックを超過した場合に停止
             self.run_callbacks("on_fit_epoch_end")  # フィットエポック終了時にコールバックを実行
-            self._clear_memory()  # メモリをクリア
+            if self._get_memory(fraction=True) > 0.5:
+                self._clear_memory()  # メモリをクリア
 
             # Early Stopping
             if RANK != -1:  # if DDP training。DDPトレーニングの場合
@@ -488,18 +487,31 @@ class BaseTrainer:
                 self.plot_metrics()  # メトリクスをプロット
             self.run_callbacks("on_train_end")  # トレーニング終了時にコールバックを実行
         self._clear_memory()  # メモリをクリア
+        unset_deterministic()
         self.run_callbacks("teardown")  # ティアダウン時にコールバックを実行
 
-    def _get_memory(self):
+    def auto_batch(self, max_num_obj=0):
+        """Calculate optimal batch size based on model and device memory constraints."""
+        return check_train_batch_size(
+            model=self.model,
+            imgsz=self.args.imgsz,
+            amp=self.amp,
+            batch=self.batch_size,
+            max_num_obj=max_num_obj,
+        )  # returns batch size
+    def _get_memory(self, fraction=False):
         """Get accelerator memory utilization in GB."""
         # GB単位のアクセラレータメモリ使用率を取得します。
-        if self.device.type == "mps":  # デバイスタイプがmpsの場合
-            memory = torch.mps.driver_allocated_memory()  # MPSメモリを取得
-        elif self.device.type == "cpu":  # デバイスタイプがcpuの場合
-            memory = 0  # メモリを0に設定
-        else:  # それ以外の場合
-            memory = torch.cuda.memory_reserved()  # CUDAメモリを取得
-        return memory / 1e9  # GB単位で返す
+        memory, total = 0, 0
+        if self.device.type == "mps":
+            memory = torch.mps.driver_allocated_memory()
+            if fraction:
+                return __import__("psutil").virtual_memory().percent / 100
+        elif self.device.type != "cpu":
+            memory = torch.cuda.memory_reserved()
+            if fraction:
+                total = torch.cuda.get_device_properties(self.device).total_memory
+        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2**30)
 
     def _clear_memory(self):
         """Clear accelerator memory on different platforms."""
@@ -518,7 +530,13 @@ class BaseTrainer:
         import pandas as pd  # scope for faster 'import ultralytics'。より高速な「import ultralytics」のスコープ
 
         return pd.read_csv(self.csv).to_dict(orient="list")  # csvを読み取って辞書に変換
-
+    def _model_train(self):
+        """Set model in training mode."""
+        self.model.train()
+        # Freeze BN stat
+        for n, m in self.model.named_modules():
+            if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
+                m.eval()
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
         # 追加のメタデータを使用してモデルトレーニングチェックポイントを保存します。
@@ -575,6 +593,10 @@ class BaseTrainer:
         except Exception as e:  # 例外が発生した場合
             raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e  # エラーメッセージを生成
         self.data = data  # データセットをアタッチ
+        if self.args.single_cls:
+            LOGGER.info("Overriding class names with single class.")
+            self.data["names"] = {0: "item"}
+            self.data["nc"] = 1
         return data["train"], data.get("val") or data.get("test")  # トレーニングパスと検証パスを返す
 
     def setup_model(self):
@@ -690,7 +712,7 @@ class BaseTrainer:
         n = len(metrics) + 2  # number of cols。列数
         s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # header。ヘッダー
         t = time.time() - self.train_time_start  # 時間を計算
-        with open(self.csv, "a") as f:  # ファイルを開く
+        with open(self.csv, "a", encoding="utf-8") as f:  # ファイルを開く
             f.write(s + ("%.6g," * n % tuple([self.epoch + 1, t] + vals)).rstrip(",") + "\n")  # メトリクスを保存
 
     def plot_metrics(self):
@@ -732,7 +754,7 @@ class BaseTrainer:
 
                 # Check that resume data YAML exists, otherwise strip to force re-download of dataset
                 ckpt_args = attempt_load_weights(last).args  # レジュームチェックポイント引数をロード
-                if not Path(ckpt_args["data"]).exists():  # データYAMLが存在するかどうかをチェック
+                if not isinstance(ckpt_args["data"], dict) and not Path(ckpt_args["data"]).exists():
                     ckpt_args["data"] = self.args.data  # データYAMLを更新
 
                 resume = True  # レジュームをTrueに設定
@@ -772,10 +794,16 @@ class BaseTrainer:
             f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
         )
         LOGGER.info(f"Resuming training {self.args.model} from epoch {start_epoch + 1} to {self.epochs} total epochs")  # ログを出力
-        if start_epoch > (self.epochs - self.args.close_mosaic):  # 開始エポックがclose_mosaicを超える場合
-            self._close_dataloader_mosaic()  # データローダーモザイクを閉じる
+        if self.epochs < start_epoch:
+            LOGGER.info(
+                f"{self.model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs."
+            )
+            self.epochs += ckpt["epoch"]  # finetune additional epochs
         self.best_fitness = best_fitness  # 最高の適合度を設定
         self.start_epoch = start_epoch  # 開始エポックを設定
+        if start_epoch > (self.epochs - self.args.close_mosaic):  # 開始エポックがclose_mosaicを超える場合
+            self._close_dataloader_mosaic()  # データローダーモザイクを閉じる
+
 
     def _close_dataloader_mosaic(self):
         """Update dataloaders to stop using mosaic augmentation."""
@@ -808,7 +836,7 @@ class BaseTrainer:
                 f"ignoring 'lr0={self.args.lr0}' and 'momentum={self.args.momentum}' and "
                 f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
             )  # ログを出力
-            nc = getattr(model, "nc", 10)  # number of classes。クラス数
+            nc = self.data.get("nc", 10)  # number of classes。クラス数
             lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places。6桁の10進数へのlr0適合方程式
             name, lr, momentum = ("SGD", 0.01, 0.9) if iterations > 10000 else ("AdamW", lr_fit, 0.9)  # オプティマイザ、学習率、モメンタムを設定
             self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam。Adamの場合は0.01を超えない
@@ -822,7 +850,8 @@ class BaseTrainer:
                     g[1].append(param)  # 正規化レイヤをリストに追加
                 else:  # weight (with decay)。重み（減衰あり）
                     g[0].append(param)  # その他のパラメータをリストに追加
-
+        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
+        name = {x.lower(): x for x in optimizers}.get(name.lower())
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:  # アダム系オプティマイザの場合
             optimizer = getattr(optim, name, optim.Adam)(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0)  # オプティマイザを初期化
         elif name == "RMSProp":  # RMSPropオプティマイザの場合

@@ -240,7 +240,8 @@ class C2f(nn.Module):
 
     def forward_split(self, x):
         """Forward pass using split() instead of chunk()."""
-        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y = self.cv1(x).split((self.c, self.c), 1)
+        y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
@@ -279,8 +280,8 @@ class RepC3(nn.Module):
         """Initialize CSP Bottleneck with a single convolution using input channels, output channels, and number."""
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c2, 1, 1)
-        self.cv2 = Conv(c1, c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
         self.m = nn.Sequential(*[RepConv(c_, c_) for _ in range(n)])
         self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
 
@@ -426,7 +427,7 @@ class MaxSigmoidAttnBlock(nn.Module):
         bs, _, h, w = x.shape
 
         guide = self.gl(guide)
-        guide = guide.view(bs, -1, self.nh, self.hc)
+        guide = guide.view(bs, guide.shape[1], self.nh, self.hc)
         embed = self.ec(x) if self.ec is not None else x
         embed = embed.view(bs, self.nh, self.hc, h, w)
 
@@ -549,6 +550,21 @@ class BNContrastiveHead(nn.Module):
         self.bias = nn.Parameter(torch.tensor([-10.0]))
         # use -1.0 is more stable
         self.logit_scale = nn.Parameter(-1.0 * torch.ones([]))
+
+    def fuse(self):
+        """Fuse the batch normalization layer in the BNContrastiveHead module."""
+        del self.norm
+        del self.bias
+        del self.logit_scale
+        self.forward = self.forward_fuse
+
+    def forward_fuse(self, x, w):
+        """
+        Passes input out unchanged.
+
+        TODO: Update or remove?
+        """
+        return x
 
     def forward(self, x, w):
         """Forward function of contrastive learning."""

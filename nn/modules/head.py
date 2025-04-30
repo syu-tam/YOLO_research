@@ -7,10 +7,12 @@ import math
 import torch
 import torch.nn as nn
 
-from utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
+
+from utils.tal import TORCH_1_10, dist2bbox, make_anchors
 
 from .block import DFL
 from .conv import Conv, DWConv, Conv_withoutBN
+
 
 __all__ = "Detect", "v10Detect"
 
@@ -18,14 +20,16 @@ class Detect(nn.Module):
     """YOLO Detect head for detection models."""
     # 検出モデル用のYOLO検出ヘッド。
 
-    dynamic = False  # force grid reconstruction。グリッド再構築を強制
-    export = False  # export mode。エクスポートモード
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    format = None  # export format
     end2end = False  # end2end
     max_det = 300  # max_det
-    shape = None  # 形状
-    anchors = torch.empty(0)  # init。初期化
-    strides = torch.empty(0)  # init。初期化
-    legacy = False  # backward compatibility for v3/v5/v8/v9 models。v3 / v5 / v8 / v9モデルとの下位互換性
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+    legacy = False  # backward compatibility for v3/v5/v8/v9 models
+    xyxy = False  # xyxy or xywh output
 
     def __init__(self, nc=80, ch=()):
         """Initializes the YOLO detection layer with specified number of classes and channels."""
@@ -103,11 +107,11 @@ class Detect(nn.Module):
         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps."""
         # 複数レベルのフィーチャマップに基づいて、予測されたバウンディングボックスとクラス確率をデコードします。
         # Inference path
-        shape = x[0].shape  # BCHW。形状を取得
-        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)  # 特徴を連結
-        if self.dynamic or self.shape != shape:  # 動的または形状が異なる場合
-            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))  # アンカーとストライドを生成
-            self.shape = shape  # 形状を設定
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.format != "imx" and (self.dynamic or self.shape != shape):
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
 
         if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops。TF FlexSplitV opsを回避
             box = x_cat[:, : self.reg_max * 4]
@@ -118,13 +122,18 @@ class Detect(nn.Module):
         if self.export and self.format in {"tflite", "edgetpu"}:  # 推論をエクスポートする場合
             # Precompute normalization factor to increase numerical stability
             # See https://github.com/ultralytics/ultralytics/issues/7371
-            grid_h = shape[2]  # グリッド高
-            grid_w = shape[3]  # グリッド幅
-            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)  # グリッドサイズ
-            norm = self.strides / (self.stride[0] * grid_size)  # 正規化
-            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])  # バウンディングボックスをデコード
-        else:  # それ以外の場合
-            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides  # バウンディングボックスをデコード
+            grid_h = shape[2]
+            grid_w = shape[3]
+            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * grid_size)
+            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
+        elif self.export and self.format == "imx":
+            dbox = self.decode_bboxes(
+                self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
+            )
+            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
+        else:
+            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
         return torch.cat((dbox, cls.sigmoid()), 1)  # バウンディングボックスとクラスを連結
 
@@ -201,6 +210,10 @@ class v10Detect(Detect):
             for x in ch
         )  # 畳み込みレイヤー
         self.one2one_cv3 = copy.deepcopy(self.cv3)  # cv3をコピー
+    
+    def fuse(self):
+        """Removes the one2many head."""
+        self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
 
 
 class Detectv2(nn.Module):
@@ -299,8 +312,8 @@ class Detectv2(nn.Module):
             self.align_conv[i](pre_pan_feats[i]) for i in range(self.nl)
         ]
         
-        self.feature_maps['pre_pan'] = list(pre_pan_feats_aligned)
-        self.feature_maps['post_pan'] = list(post_pan_feats)
+        # self.feature_maps['pre_pan'] = list(pre_pan_feats_aligned)
+        # self.feature_maps['post_pan'] = list(post_pan_feats)
         
         one2many = [
             torch.cat((self.cv2[i](post_pan_feats[i]), self.cv3[i](post_pan_feats[i])), 1) for i in range(self.nl)

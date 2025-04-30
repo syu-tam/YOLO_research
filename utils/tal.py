@@ -58,17 +58,45 @@ class TaskAlignedAssigner(nn.Module):
         """
         self.bs = pd_scores.shape[0]
         self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
 
         if self.n_max_boxes == 0:
-            device = gt_bboxes.device
             return (
-                torch.full_like(pd_scores[..., 0], self.bg_idx).to(device),
-                torch.zeros_like(pd_bboxes).to(device),
-                torch.zeros_like(pd_scores).to(device),
-                torch.zeros_like(pd_scores[..., 0]).to(device),
-                torch.zeros_like(pd_scores[..., 0]).to(device),
+                torch.full_like(pd_scores[..., 0], self.bg_idx),
+                torch.zeros_like(pd_bboxes),
+                torch.zeros_like(pd_scores),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),
             )
 
+        try:
+            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+        except torch.cuda.OutOfMemoryError:
+            # Move tensors to CPU, compute, then move back to original device
+            LOGGER.warning("CUDA OutOfMemoryError in TaskAlignedAssigner, using CPU")
+            cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
+            result = self._forward(*cpu_tensors)
+            return tuple(t.to(device) for t in result)
+
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """
+        Compute the task-aligned assignment.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
+
+        Returns:
+            target_labels (torch.Tensor): Target labels with shape (bs, num_total_anchors).
+            target_bboxes (torch.Tensor): Target bounding boxes with shape (bs, num_total_anchors, 4).
+            target_scores (torch.Tensor): Target scores with shape (bs, num_total_anchors, num_classes).
+            fg_mask (torch.Tensor): Foreground mask with shape (bs, num_total_anchors).
+            target_gt_idx (torch.Tensor): Target ground truth indices with shape (bs, num_total_anchors).
+        """
         mask_pos, align_metric, overlaps = self.get_pos_mask(
             pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
         )
@@ -88,7 +116,22 @@ class TaskAlignedAssigner(nn.Module):
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
-        """Get in_gts mask, (b, max_num_obj, h*w)."""
+        """
+        Get positive mask for each ground truth box.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            anc_points (torch.Tensor): Anchor points with shape (num_total_anchors, 2).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, 1).
+
+        Returns:
+            mask_pos (torch.Tensor): Positive mask with shape (bs, max_num_obj, h*w).
+            align_metric (torch.Tensor): Alignment metric with shape (bs, max_num_obj, h*w).
+            overlaps (torch.Tensor): Overlaps between predicted and ground truth boxes with shape (bs, max_num_obj, h*w).
+        """
         mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
         # Get anchor_align metric, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
@@ -100,7 +143,20 @@ class TaskAlignedAssigner(nn.Module):
         return mask_pos, align_metric, overlaps
 
     def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
-        """Compute alignment metric given predicted and ground truth bounding boxes."""
+        """
+        Compute alignment metric given predicted and ground truth bounding boxes.
+
+        Args:
+            pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
+            pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
+            gt_labels (torch.Tensor): Ground truth labels with shape (bs, n_max_boxes, 1).
+            gt_bboxes (torch.Tensor): Ground truth boxes with shape (bs, n_max_boxes, 4).
+            mask_gt (torch.Tensor): Mask for valid ground truth boxes with shape (bs, n_max_boxes, h*w).
+
+        Returns:
+            align_metric (torch.Tensor): Alignment metric combining classification and localization.
+            overlaps (torch.Tensor): IoU overlaps between predicted and ground truth boxes.
+        """
         na = pd_bboxes.shape[-2]
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
         overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
@@ -306,7 +362,7 @@ def make_anchors(feats, strides, grid_cell_offset=0.5):
     assert feats is not None
     dtype, device = feats[0].dtype, feats[0].device
     for i, stride in enumerate(strides):
-        _, _, h, w = feats[i].shape
+        h, w = feats[i].shape[2:] if isinstance(feats, list) else (int(feats[i][0]), int(feats[i][1]))
         sx = torch.arange(end=w, device=device, dtype=dtype) + grid_cell_offset  # shift x
         sy = torch.arange(end=h, device=device, dtype=dtype) + grid_cell_offset  # shift y
         sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_10 else torch.meshgrid(sy, sx)

@@ -122,7 +122,9 @@ class BasePredictor:
         not_tensor = not isinstance(im, torch.Tensor)
         if not_tensor:
             im = np.stack(self.pre_transform(im))
-            im = im[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW, (n, 3, h, w)
+            if im.shape[-1] == 3:
+                im = im[..., ::-1]  # BGR to RGB
+            im = im.transpose((0, 3, 1, 2))  # BHWC to BCHW, (n, 3, h, w)
             im = np.ascontiguousarray(im)  # contiguous
             im = torch.from_numpy(im)
 
@@ -152,7 +154,13 @@ class BasePredictor:
             (list): A list of transformed images.
         """
         same_shapes = len({x.shape for x in im}) == 1
-        letterbox = LetterBox(self.imgsz, auto=same_shapes and self.model.pt, stride=self.model.stride)
+        letterbox = LetterBox(
+            self.imgsz,
+            auto=same_shapes
+            and self.args.rect
+            and (self.model.pt or (getattr(self.model, "dynamic", False) and not self.model.imx)),
+            stride=self.model.stride,
+        )
         return [letterbox(image=x) for x in im]
 
     def postprocess(self, preds, img, orig_imgs):
@@ -190,7 +198,7 @@ class BasePredictor:
             getattr(
                 self.model.model,
                 "transforms",
-                classify_transforms(self.imgsz[0], crop_fraction=self.args.crop_fraction),
+                classify_transforms(self.imgsz[0]),
             )
             if self.args.task == "classify"
             else None
@@ -231,7 +239,9 @@ class BasePredictor:
 
             # Warmup model
             if not self.done_warmup:
-                self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
+                self.model.warmup(
+                    imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, self.model.ch, *self.imgsz)
+                )
                 self.done_warmup = True
 
             self.seen, self.windows, self.batch = 0, [], None
@@ -290,7 +300,7 @@ class BasePredictor:
             t = tuple(x.t / self.seen * 1e3 for x in profilers)  # speeds per image
             LOGGER.info(
                 f"Speed: %.1fms preprocess, %.1fms inference, %.1fms postprocess per image at shape "
-                f"{(min(self.args.batch, self.seen), 3, *im.shape[2:])}" % t
+                f"{(min(self.args.batch, self.seen), getattr(self.model, 'ch', 3), *im.shape[2:])}" % t
             )
         if self.args.save or self.args.save_txt or self.args.save_crop:
             nl = len(list(self.save_dir.glob("labels/*.txt")))  # number of labels
@@ -362,7 +372,7 @@ class BasePredictor:
         # Save videos and streams
         if self.dataset.mode in {"stream", "video"}:
             fps = self.dataset.fps if self.dataset.mode == "video" else 30
-            frames_path = f'{save_path.split(".", 1)[0]}_frames/'
+            frames_path = f"{save_path.split('.', 1)[0]}_frames/"
             if save_path not in self.vid_writer:  # new video
                 if self.args.save_frames:
                     Path(frames_path).mkdir(parents=True, exist_ok=True)

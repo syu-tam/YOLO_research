@@ -105,15 +105,15 @@ class BaseValidator:
             )
 
             # self.model = model
-            self.device = model.device  # update device。デバイスを更新
-            self.args.half = model.fp16  # update half。半精度を更新
-            stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine  # 属性を取得
-            imgsz = check_imgsz(self.args.imgsz, stride=stride)  # 画像サイズをチェック
-            if engine:  # エンジンがある場合
-                self.args.batch = model.batch_size  # バッチサイズを設定
-            elif not pt and not jit:  # ptとjitがない場合
-                self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1。デフォルトのバッチサイズ1
-                LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")  # ログを出力
+            self.device = model.device  # update device
+            self.args.half = model.fp16  # update half
+            stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
+            imgsz = check_imgsz(self.args.imgsz, stride=stride)
+            if engine:
+                self.args.batch = model.batch_size
+            elif not (pt or jit or getattr(model, "dynamic", False)):
+                self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
+                LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
 
             if str(self.args.data).split(".")[-1] in {"yaml", "yml"}:  # データ形式がyamlの場合
                 self.data = check_det_dataset(self.args.data)  # 検出データセットをチェック
@@ -122,12 +122,12 @@ class BaseValidator:
             else:  # その他の場合
                 raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))  # エラーを発生
 
-            if self.device.type in {"cpu", "mps"}:  # デバイスタイプがcpuまたはmpsの場合
-                self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading。ワーカーを0に設定
-            if not pt:  # ptがない場合
-                self.args.rect = False  # アスペクト比固定を無効化
-            self.stride = model.stride  # used in get_dataloader() for padding。パディングに使用されるストライド
-            self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)  # データローダーを取得
+            if self.device.type in {"cpu", "mps"}:
+                self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
+            if not (pt or getattr(model, "dynamic", False)):
+                self.args.rect = False
+            self.stride = model.stride  # used in get_dataloader() for padding
+            self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()  # 評価モードを設定
             model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup。ウォームアップ
@@ -195,17 +195,21 @@ class BaseValidator:
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")  # ログを出力
             return stats  # 統計を返す
 
-    def match_predictions(self, pred_classes, true_classes, iou, use_scipy=False):
-        # IoUを使用して、予測をグランドトゥルースオブジェクト（pred_classes、true_classes）と一致させます。
-        #
-        # 引数：
-        #     pred_classes (torch.Tensor): 形状(N,)の予測されたクラスインデックス。
-        #     true_classes (torch.Tensor): 形状(M,)のターゲットクラスインデックス。
-        #     iou (torch.Tensor): 予測と真実のグラウンドのペアワイズIoU値を含むNxMテンソル
-        #     use_scipy (bool): マッチングにscipyを使用するかどうか（より正確）。
-        #
-        # 戻り値：
-        #     (torch.Tensor): 10個のIoUしきい値に対する形状(N,10)の正しいテンソル。
+    def match_predictions(
+        self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
+    ) -> torch.Tensor:
+        """
+        Match predictions to ground truth objects using IoU.
+
+        Args:
+            pred_classes (torch.Tensor): Predicted class indices of shape (N,).
+            true_classes (torch.Tensor): Target class indices of shape (M,).
+            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground truth.
+            use_scipy (bool): Whether to use scipy for matching (more precise).
+
+        Returns:
+            (torch.Tensor): Correct tensor of shape (N, 10) for 10 IoU thresholds.
+        """
         # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)  # 正しい行列を初期化
         # LxD matrix where L - labels (rows), D - detections (columns)

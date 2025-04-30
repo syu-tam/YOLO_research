@@ -10,7 +10,6 @@ from data import build_dataloader, build_yolo_dataset, converter
 from engine.validator import BaseValidator
 from utils import LOGGER, ops
 from utils.checks import check_requirements
-from utils.ops import non_max_suppression
 from utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from utils.plotting import output_to_target, plot_images
 
@@ -28,24 +27,26 @@ class DetectionValidator(BaseValidator):
     #     ```
 
     def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
-        """Initialize detection model with necessary variables and settings."""
-        # 必要な変数と設定を使用して検出モデルを初期化します。
-        super().__init__(dataloader, save_dir, pbar, args, _callbacks)  # 親クラスを初期化
-        self.nt_per_class = None  # クラスごとのターゲット数
-        self.nt_per_image = None  # 画像ごとのターゲット数
-        self.is_coco = False  # COCOデータセットかどうか
-        self.is_lvis = False  # LVISデータセットかどうか
-        self.class_map = None  # クラスマップ
-        self.args.task = "detect"  # タスクを検出に設定
-        self.metrics = DetMetrics(save_dir=self.save_dir, on_plot=self.on_plot)  # 検出メトリクスを初期化
-        self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95。mAP@0.5:0.95のIoUベクトル
-        self.niou = self.iouv.numel()  # IoUベクトル数
-        self.lb = []  # for autolabelling。自動ラベル付け用
-        if self.args.save_hybrid:  # ハイブリッド保存がTrueの場合
-            LOGGER.warning(
-                "WARNING ⚠️ 'save_hybrid=True' will append ground truth to predictions for autolabelling.\n"
-                "WARNING ⚠️ 'save_hybrid=True' will cause incorrect mAP.\n"
-            )  # 警告ログを出力
+        """
+        Initialize detection validator with necessary variables and settings.
+
+        Args:
+            dataloader (torch.utils.data.DataLoader, optional): Dataloader to use for validation.
+            save_dir (Path, optional): Directory to save results.
+            pbar (Any, optional): Progress bar for displaying progress.
+            args (dict, optional): Arguments for the validator.
+            _callbacks (list, optional): List of callback functions.
+        """
+        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
+        self.nt_per_class = None
+        self.nt_per_image = None
+        self.is_coco = False
+        self.is_lvis = False
+        self.class_map = None
+        self.args.task = "detect"
+        self.metrics = DetMetrics(save_dir=self.save_dir)
+        self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
+        self.niou = self.iouv.numel()
 
     def preprocess(self, batch):
         """Preprocesses batch of images for YOLO training."""
@@ -55,16 +56,7 @@ class DetectionValidator(BaseValidator):
         for k in ["batch_idx", "cls", "bboxes"]:  # キーを反復処理
             batch[k] = batch[k].to(self.device)  # デバイスに移動
 
-        if self.args.save_hybrid:  # ハイブリッド保存がTrueの場合
-            height, width = batch["img"].shape[2:]  # 高さ、幅
-            nb = len(batch["img"])  # バッチサイズ
-            bboxes = batch["bboxes"] * torch.tensor((width, height, width, height), device=self.device)  # バウンディングボックスをスケーリング
-            self.lb = [
-                torch.cat([batch["cls"][batch["batch_idx"] == i], bboxes[batch["batch_idx"] == i]], dim=-1)
-                for i in range(nb)
-            ]  # ラベルを生成
-
-        return batch  # バッチを返す
+        return batch
 
     def init_metrics(self, model):
         """Initialize evaluation metrics for YOLO."""
@@ -75,17 +67,18 @@ class DetectionValidator(BaseValidator):
             and "coco" in val
             and (val.endswith(f"{os.sep}val2017.txt") or val.endswith(f"{os.sep}test-dev2017.txt"))
         )  # is COCO
-        self.is_lvis = isinstance(val, str) and "lvis" in val and not self.is_coco  # is LVIS。LVISデータセットかどうか
-        self.class_map = converter.coco80_to_coco91_class() if self.is_coco else list(range(len(model.names)))  # クラスマップを初期化
-        self.args.save_json |= self.args.val and (self.is_coco or self.is_lvis) and not self.training  # run final val。最終検証を実行
-        self.names = model.names  # 名前を設定
-        self.nc = len(model.names)  # クラス数を設定
-        self.metrics.names = self.names  # メトリクスの名前を設定
-        self.metrics.plot = self.args.plots  # メトリクスのプロットを設定
-        self.confusion_matrix = ConfusionMatrix(nc=self.nc, conf=self.args.conf)  # 混同行列を初期化
-        self.seen = 0  # シーンを0に設定
-        self.jdict = []  # JDictを初期化
-        self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])  # 統計を初期化
+        self.is_lvis = isinstance(val, str) and "lvis" in val and not self.is_coco  # is LVIS
+        self.class_map = converter.coco80_to_coco91_class() if self.is_coco else list(range(1, len(model.names) + 1))
+        self.args.save_json |= self.args.val and (self.is_coco or self.is_lvis) and not self.training  # run final val
+        self.names = model.names
+        self.nc = len(model.names)
+        self.end2end = getattr(model, "end2end", False)
+        self.metrics.names = self.names
+        self.metrics.plot = self.args.plots
+        self.confusion_matrix = ConfusionMatrix(nc=self.nc, conf=self.args.conf)
+        self.seen = 0
+        self.jdict = []
+        self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
 
     def get_desc(self):
         """Return a formatted string summarizing class metrics of YOLO model."""
@@ -93,18 +86,26 @@ class DetectionValidator(BaseValidator):
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")  # 文字列を返す
 
     def postprocess(self, preds):
-        """Apply Non-maximum suppression to prediction outputs."""
-        # 非最大抑制を予測出力に適用します。
+        """
+        Apply Non-maximum suppression to prediction outputs.
 
-        return non_max_suppression(
+        Args:
+            preds (torch.Tensor): Raw predictions from the model.
+
+        Returns:
+            (List[torch.Tensor]): Processed predictions after NMS.
+        """
+        return ops.non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
-            labels=self.lb,
+            nc=0 if self.args.task == "detect" else self.nc,
             multi_label=True,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
             max_det=self.args.max_det,
-        )  # NMSを適用
+            end2end=self.end2end,
+            rotated=self.args.task == "obb",
+        )
 
     def _prepare_batch(self, si, batch):
         """Prepares a batch of images and annotations for validation."""
@@ -161,12 +162,12 @@ class DetectionValidator(BaseValidator):
             stat["pred_cls"] = predn[:, 5]  # 予測クラスを設定
 
             # Evaluate
-            if nl:  # ラベルがある場合
-                stat["tp"] = self._process_batch(predn, bbox, cls)  # 真陽性を処理
-                if self.args.plots:  # プロットがTrueの場合
-                    self.confusion_matrix.process_batch(predn, bbox, cls)  # 混同行列を処理
-            for k in self.stats.keys():  # 統計を反復処理
-                self.stats[k].append(stat[k])  # 統計を追加
+            if nl:
+                stat["tp"] = self._process_batch(predn, bbox, cls)
+            if self.args.plots:
+                self.confusion_matrix.process_batch(predn, bbox, cls)
+            for k in self.stats.keys():
+                self.stats[k].append(stat[k])
 
             # Save
             if self.args.save_json:  # JSONを保存する場合
@@ -186,27 +187,30 @@ class DetectionValidator(BaseValidator):
         self.metrics.confusion_matrix = self.confusion_matrix  # 混同行列を設定
 
     def get_stats(self):
-        """Returns metrics statistics and results dictionary."""
-        # メトリクスの統計と結果辞書を返します。
-        stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in self.stats.items()}  # to numpy。numpyに変換
-        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=self.nc)  # クラスごとのターゲット数
-        self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=self.nc)  # 画像ごとのターゲット数
-        stats.pop("target_img", None)  # ターゲット画像を削除
-        if len(stats) and stats["tp"].any():  # 統計があり、真陽性がある場合
-            self.metrics.process(**stats)  # メトリクスを処理
-        return self.metrics.results_dict  # 結果辞書を返す
+        """
+        Calculate and return metrics statistics.
+
+        Returns:
+            (dict): Dictionary containing metrics results.
+        """
+        stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in self.stats.items()}  # to numpy
+        self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=self.nc)
+        self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=self.nc)
+        stats.pop("target_img", None)
+        if len(stats):
+            self.metrics.process(**stats, on_plot=self.on_plot)
+        return self.metrics.results_dict
 
     def print_results(self):
-        """Prints training/validation set metrics per class."""
-        # クラスごとのトレーニング/検証セットのメトリクスを出力します。
-        pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format。印刷形式
-        LOGGER.info(pf % ("all", self.seen, self.nt_per_class.sum(), *self.metrics.mean_results()))  # ログを出力
-        if self.nt_per_class.sum() == 0:  # クラスごとのターゲット数の合計が0の場合
-            LOGGER.warning(f"WARNING ⚠️ no labels found in {self.args.task} set, can not compute metrics without labels")  # 警告ログを出力
+        """Print training/validation set metrics per class."""
+        pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format
+        LOGGER.info(pf % ("all", self.seen, self.nt_per_class.sum(), *self.metrics.mean_results()))
+        if self.nt_per_class.sum() == 0:
+            LOGGER.warning(f"no labels found in {self.args.task} set, can not compute metrics without labels")
 
         # Print results per class
-        if self.args.verbose and not self.training and self.nc > 1 and len(self.stats):  # 詳細モード、トレーニングモードではない、クラス数が1より大きい、統計がある場合
-            for i, c in enumerate(self.metrics.ap_class_index):  # クラスを反復処理
+        if self.args.verbose and not self.training and self.nc > 1 and len(self.stats):
+            for i, c in enumerate(self.metrics.ap_class_index):
                 LOGGER.info(
                     pf % (self.names[c], self.nt_per_image[c], self.nt_per_class[c], *self.metrics.class_result(i))
                 )  # ログを出力
@@ -234,13 +238,18 @@ class DetectionValidator(BaseValidator):
         return self.match_predictions(detections[:, 5], gt_cls, iou)  # 予測を照合
 
     def build_dataset(self, img_path, mode="val", batch=None):
-        # YOLOデータセットを構築します。
-        #
-        # 引数：
-        #     img_path (str): 画像を含むフォルダへのパス。
-        #     mode (str): 「train」モードまたは「val」モード。ユーザーは各モードに対して異なる拡張機能をカスタマイズできます。
-        #     batch (int, optional): バッチのサイズ。「rect」用です。デフォルトはNoneです。
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)  # YOLOデータセットを構築して返す
+        """
+        Build YOLO Dataset.
+
+        Args:
+            img_path (str): Path to the folder containing images.
+            mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
+            batch (int, optional): Size of batches, this is for `rect`.
+
+        Returns:
+            (Dataset): YOLO dataset.
+        """
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)
 
     def get_dataloader(self, dataset_path, batch_size):
         """Construct and return dataloader."""
@@ -296,11 +305,10 @@ class DetectionValidator(BaseValidator):
         for p, b in zip(predn.tolist(), box.tolist()):  # 予測とボックスを反復処理
             self.jdict.append(  # JSONディクショナリに追加
                 {
-                    "image_id": image_id,  # 画像ID
-                    "category_id": self.class_map[int(p[5])]
-                    + (1 if self.is_lvis else 0),  # index starts from 1 if it's lvis。インデックスはlvisの場合は1から始まります
-                    "bbox": [round(x, 3) for x in b],  # バウンディングボックス
-                    "score": round(p[4], 5),  # スコア
+                    "image_id": image_id,
+                    "category_id": self.class_map[int(p[5])],
+                    "bbox": [round(x, 3) for x in b],
+                    "score": round(p[4], 5),
                 }
             )
 
@@ -341,8 +349,13 @@ class DetectionValidator(BaseValidator):
                     val.print_results()  # explicitly call print_results。明示的にprint_resultsを呼び出す
                 # update mAP50-95 and mAP50
                 stats[self.metrics.keys[-1]], stats[self.metrics.keys[-2]] = (
-                    val.stats[:2] if self.is_coco else [val.results["AP50"], val.results["AP"]]
-                )  # 統計を更新
-            except Exception as e:  # 例外が発生した場合
-                LOGGER.warning(f"{pkg} unable to run: {e}")  # 警告ログを出力
-        return stats  # 統計を返す
+                    val.stats[:2] if self.is_coco else [val.results["AP"], val.results["AP50"]]
+                )
+                if self.is_lvis:
+                    stats["metrics/APr(B)"] = val.results["APr"]
+                    stats["metrics/APc(B)"] = val.results["APc"]
+                    stats["metrics/APf(B)"] = val.results["APf"]
+                    stats["fitness"] = val.results["AP"]
+            except Exception as e:
+                LOGGER.warning(f"{pkg} unable to run: {e}")
+        return stats

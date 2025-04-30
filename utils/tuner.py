@@ -1,13 +1,16 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-import subprocess
-
-from cfg import TASK2DATA, TASK2METRIC, get_save_dir
-from utils import DEFAULT_CFG, DEFAULT_CFG_DICT, LOGGER, NUM_THREADS, checks
+from cfg import TASK2DATA, TASK2METRIC, get_cfg, get_save_dir
+from utils import DEFAULT_CFG, DEFAULT_CFG_DICT, LOGGER, NUM_THREADS, checks, colorstr
 
 
 def run_ray_tune(
-    model, space: dict = None, grace_period: int = 10, gpu_per_trial: int = None, max_samples: int = 10, **train_args
+    model,
+    space: dict = None,
+    grace_period: int = 10,
+    gpu_per_trial: int = None,
+    max_samples: int = 10,
+    **train_args,
 ):
     """
     Runs hyperparameter tuning using Ray Tune.
@@ -39,7 +42,7 @@ def run_ray_tune(
         train_args = {}
 
     try:
-        subprocess.run("pip install ray[tune]".split(), check=True)  # do not add single quotes here
+        checks.check_requirements("ray[tune]")
 
         import ray
         from ray import tune
@@ -80,6 +83,7 @@ def run_ray_tune(
         "bgr": tune.uniform(0.0, 1.0),  # image channel BGR (probability)
         "mosaic": tune.uniform(0.0, 1.0),  # image mixup (probability)
         "mixup": tune.uniform(0.0, 1.0),  # image mixup (probability)
+        "cutmix": tune.uniform(0.0, 1.0),  # image cutmix (probability)
         "copy_paste": tune.uniform(0.0, 1.0),  # segment copy-paste (probability)
     }
 
@@ -104,15 +108,15 @@ def run_ray_tune(
         return results.results_dict
 
     # Get search space
-    if not space:
+    if not space and not train_args.get("resume"):
         space = default_space
-        LOGGER.warning("WARNING ⚠️ search space not provided, using default search space.")
+        LOGGER.warning("search space not provided, using default search space.")
 
     # Get dataset
     data = train_args.get("data", TASK2DATA[task])
     space["data"] = data
     if "data" not in train_args:
-        LOGGER.warning(f'WARNING ⚠️ data not provided, using default "data={data}".')
+        LOGGER.warning(f'data not provided, using default "data={data}".')
 
     # Define the trainable function with allocated resources
     trainable_with_resources = tune.with_resources(_tune, {"cpu": NUM_THREADS, "gpu": gpu_per_trial or 0})
@@ -131,14 +135,29 @@ def run_ray_tune(
     tuner_callbacks = [WandbLoggerCallback(project="YOLOv8-tune")] if wandb else []
 
     # Create the Ray Tune hyperparameter search tuner
-    tune_dir = get_save_dir(DEFAULT_CFG, name="tune").resolve()  # must be absolute dir
+    tune_dir = get_save_dir(
+        get_cfg(
+            DEFAULT_CFG,
+            {**train_args, **{"exist_ok": train_args.pop("resume", False)}},  # resume w/ same tune_dir
+        ),
+        name=train_args.pop("name", "tune"),  # runs/{task}/{tune_dir}
+    ).resolve()  # must be absolute dir
     tune_dir.mkdir(parents=True, exist_ok=True)
-    tuner = tune.Tuner(
-        trainable_with_resources,
-        param_space=space,
-        tune_config=tune.TuneConfig(scheduler=asha_scheduler, num_samples=max_samples),
-        run_config=RunConfig(callbacks=tuner_callbacks, storage_path=tune_dir),
-    )
+    if tune.Tuner.can_restore(tune_dir):
+        LOGGER.info(f"{colorstr('Tuner: ')} Resuming tuning run {tune_dir}...")
+        tuner = tune.Tuner.restore(str(tune_dir), trainable=trainable_with_resources, resume_errored=True)
+    else:
+        tuner = tune.Tuner(
+            trainable_with_resources,
+            param_space=space,
+            tune_config=tune.TuneConfig(
+                scheduler=asha_scheduler,
+                num_samples=max_samples,
+                trial_name_creator=lambda trial: f"{trial.trainable_name}_{trial.trial_id}",
+                trial_dirname_creator=lambda trial: f"{trial.trainable_name}_{trial.trial_id}",
+            ),
+            run_config=RunConfig(callbacks=tuner_callbacks, storage_path=tune_dir.parent, name=tune_dir.name),
+        )
 
     # Run the hyperparameter search
     tuner.fit()

@@ -11,6 +11,7 @@ import subprocess
 import time
 from importlib import metadata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import cv2
@@ -19,11 +20,11 @@ import requests
 import torch
 
 from utils import (
+    ARM64,
     ASSETS,
     AUTOINSTALL,
     IS_COLAB,
     IS_GIT_DIR,
-    IS_JUPYTER,
     IS_KAGGLE,
     IS_PIP_PACKAGE,
     LINUX,
@@ -36,13 +37,11 @@ from utils import (
     USER_CONFIG_DIR,
     WINDOWS,
     Retry,
-    SimpleNamespace,
     ThreadingLocked,
     TryExcept,
     clean_url,
     colorstr,
     downloads,
-    emojis,
     is_github_action_running,
     url2file,
 )
@@ -76,8 +75,7 @@ def parse_requirements(file_path=ROOT.parent / "requirements.txt", package=""):
         line = line.strip()
         if line and not line.startswith("#"):
             line = line.split("#")[0].strip()  # ignore inline comments
-            match = re.match(r"([a-zA-Z0-9-_]+)\s*([<>!=~]+.*)?", line)
-            if match:
+            if match := re.match(r"([a-zA-Z0-9-_]+)\s*([<>!=~]+.*)?", line):
                 requirements.append(SimpleNamespace(name=match[1], specifier=match[2].strip() if match[2] else ""))
 
     return requirements
@@ -97,7 +95,7 @@ def parse_version(version="0.0.0") -> tuple:
     try:
         return tuple(map(int, re.findall(r"\d+", version)[:3]))  # '2.0.1+cpu' -> (2, 0, 1)
     except Exception as e:
-        LOGGER.warning(f"WARNING ⚠️ failure for parse_version({version}), returning (0, 0, 0): {e}")
+        LOGGER.warning(f"failure for parse_version({version}), returning (0, 0, 0): {e}")
         return 0, 0, 0
 
 
@@ -111,11 +109,7 @@ def is_ascii(s) -> bool:
     Returns:
         (bool): True if the string is composed only of ASCII characters, False otherwise.
     """
-    # Convert list, tuple, None, etc. to string
-    s = str(s)
-
-    # Check if the string is composed of only ASCII characters
-    return all(ord(c) < 128 for c in s)
+    return all(ord(c) < 128 for c in str(s))
 
 
 def check_imgsz(imgsz, stride=32, min_dim=1, max_dim=2, floor=0):
@@ -157,14 +151,14 @@ def check_imgsz(imgsz, stride=32, min_dim=1, max_dim=2, floor=0):
         )
         if max_dim != 1:
             raise ValueError(f"imgsz={imgsz} is not a valid image size. {msg}")
-        LOGGER.warning(f"WARNING ⚠️ updating to 'imgsz={max(imgsz)}'. {msg}")
+        LOGGER.warning(f"updating to 'imgsz={max(imgsz)}'. {msg}")
         imgsz = [max(imgsz)]
     # Make image size a multiple of the stride
     sz = [max(math.ceil(x / stride) * stride, floor) for x in imgsz]
 
     # Print warning message if image size was updated
     if sz != imgsz:
-        LOGGER.warning(f"WARNING ⚠️ imgsz={imgsz} must be multiple of max stride {stride}, updating to {sz}")
+        LOGGER.warning(f"imgsz={imgsz} must be multiple of max stride {stride}, updating to {sz}")
 
     # Add missing dimensions if necessary
     sz = [sz[0], sz[0]] if min_dim == 2 and len(sz) == 1 else sz[0] if min_dim == 1 and len(sz) == 1 else sz
@@ -210,7 +204,7 @@ def check_version(
         ```
     """
     if not current:  # if current is '' or None
-        LOGGER.warning(f"WARNING ⚠️ invalid check_version({current}, {required}) requested, please check values.")
+        LOGGER.warning(f"invalid check_version({current}, {required}) requested, please check values.")
         return True
     elif not current[0].isdigit():  # current is package name rather than version string, i.e. current='ultralytics'
         try:
@@ -218,7 +212,7 @@ def check_version(
             current = metadata.version(current)  # get version string from package name
         except metadata.PackageNotFoundError as e:
             if hard:
-                raise ModuleNotFoundError(emojis(f"WARNING ⚠️ {current} package is required but not installed")) from e
+                raise ModuleNotFoundError(f"{current} package is required but not installed") from e
             else:
                 return False
 
@@ -254,9 +248,9 @@ def check_version(
         elif op == "<" and not (c < v):
             result = False
     if not result:
-        warning = f"WARNING ⚠️ {name}{op}{version} is required, but {name}=={current} is currently installed {msg}"
+        warning = f"{name}{required} is required, but {name}=={current} is currently installed {msg}"
         if hard:
-            raise ModuleNotFoundError(emojis(warning))  # assert version requirements met
+            raise ModuleNotFoundError(warning)  # assert version requirements met
         if verbose:
             LOGGER.warning(warning)
     return result
@@ -409,9 +403,9 @@ def check_requirements(requirements=ROOT.parent / "requirements.txt", exclude=()
                 assert ONLINE, "AutoUpdate skipped (offline)"
                 LOGGER.info(attempt_install(s, cmds))
                 dt = time.time() - t
-                LOGGER.info(
-                    f"{prefix} AutoUpdate success ✅ {dt:.1f}s, installed {n} package{'s' * (n > 1)}: {pkgs}\n"
-                    f"{prefix} ⚠️ {colorstr('bold', 'Restart runtime or rerun command for updates to take effect')}\n"
+                LOGGER.info(f"{prefix} AutoUpdate success ✅ {dt:.1f}s, installed {n} package{'s' * (n > 1)}: {pkgs}")
+                LOGGER.warning(
+                    f"{prefix} {colorstr('bold', 'Restart runtime or rerun command for updates to take effect')}\n"
                 )
             except Exception as e:
                 LOGGER.warning(f"{prefix} ❌ {e}")
@@ -435,6 +429,8 @@ def check_torchvision():
     """
     # Compatibility table
     compatibility_table = {
+        "2.6": ["0.21"],
+        "2.5": ["0.20"],
         "2.4": ["0.19"],
         "2.3": ["0.18"],
         "2.2": ["0.17"],
@@ -450,8 +446,8 @@ def check_torchvision():
         compatible_versions = compatibility_table[v_torch]
         v_torchvision = ".".join(TORCHVISION_VERSION.split("+")[0].split(".")[:2])
         if all(v_torchvision != v for v in compatible_versions):
-            print(
-                f"WARNING ⚠️ torchvision=={v_torchvision} is incompatible with torch=={v_torch}.\n"
+            LOGGER.warning(
+                f"torchvision=={v_torchvision} is incompatible with torch=={v_torch}.\n"
                 f"Run 'pip install torchvision=={compatible_versions[0]}' to fix torchvision or "
                 "'pip install -U torch torchvision' to update both.\n"
                 "For a full compatibility table see https://github.com/pytorch/vision#installation"
@@ -459,7 +455,14 @@ def check_torchvision():
 
 
 def check_suffix(file="yolo11n.pt", suffix=".pt", msg=""):
-    """Check file(s) for acceptable suffix."""
+    """
+    Check file(s) for acceptable suffix.
+
+    Args:
+        file (str | List[str]): File or list of files to check.
+        suffix (str | Tuple[str]): Acceptable suffix or tuple of suffixes.
+        msg (str): Additional message to display in case of error.
+    """
     if file and suffix:
         if isinstance(suffix, str):
             suffix = (suffix,)
@@ -569,11 +572,8 @@ def check_yolo(verbose=True, device=""):
 
     from utils.torch_utils import select_device
 
-    if IS_JUPYTER:
-        if check_requirements("wandb", install=False):
-            os.system("pip uninstall -y wandb")  # uninstall wandb: unwanted account creation prompt with infinite hang
-        if IS_COLAB:
-            shutil.rmtree("sample_data", ignore_errors=True)  # remove colab /sample_data directory
+    if IS_COLAB:
+        shutil.rmtree("sample_data", ignore_errors=True)  # remove colab /sample_data directory
 
     if verbose:
         # System info
@@ -611,6 +611,7 @@ def collect_system_info():
         "Environment": ENVIRONMENT,
         "Python": PYTHON_VERSION,
         "Install": "git" if IS_GIT_DIR else "pip" if IS_PIP_PACKAGE else "other",
+        "Path": str(ROOT),
         "RAM": f"{psutil.virtual_memory().total / gib:.2f} GB",
         "Disk": f"{(total - free) / gib:.1f}/{total / gib:.1f} GB",
         "CPU": get_cpu_info(),
@@ -673,8 +674,22 @@ def check_amp(model):
     from utils.torch_utils import autocast
 
     device = next(model.parameters()).device  # get model device
+    prefix = colorstr("AMP: ")
     if device.type in {"cpu", "mps"}:
         return False  # AMP only used on CUDA devices
+    else:
+        # GPUs that have issues with AMP
+        pattern = re.compile(
+            r"(nvidia|geforce|quadro|tesla).*?(1660|1650|1630|t400|t550|t600|t1000|t1200|t2000|k40m)", re.IGNORECASE
+        )
+
+        gpu = torch.cuda.get_device_name(device)
+        if bool(pattern.search(gpu)):
+            LOGGER.warning(
+                f"{prefix}checks failed ❌. AMP training on {gpu} GPU may cause "
+                f"NaN losses or zero-mAP results, so AMP will be disabled during training."
+            )
+            return False
 
     def amp_allclose(m, im):
         """All close FP32 vs AMP results."""
@@ -687,7 +702,6 @@ def check_amp(model):
         return a.shape == b.shape and torch.allclose(a, b.float(), atol=0.5)  # close to 0.5 absolute tolerance
 
     im = ASSETS / "bus.jpg"  # image to check
-    prefix = colorstr("AMP: ")
     LOGGER.info(f"{prefix}running Automatic Mixed Precision (AMP) checks...")
     warning_msg = "Setting 'amp=True'. If you experience zero-mAP or NaN losses you can disable AMP with amp=False."
     try:
@@ -696,17 +710,15 @@ def check_amp(model):
         assert amp_allclose(YOLO("yolo11n.pt"), im)
         LOGGER.info(f"{prefix}checks passed ✅")
     except ConnectionError:
-        LOGGER.warning(
-            f"{prefix}checks skipped ⚠️. " f"Offline and unable to download YOLO11n for AMP checks. {warning_msg}"
-        )
+        LOGGER.warning(f"{prefix}checks skipped. Offline and unable to download YOLO11n for AMP checks. {warning_msg}")
     except (AttributeError, ModuleNotFoundError):
         LOGGER.warning(
-            f"{prefix}checks skipped ⚠️. "
+            f"{prefix}checks skipped. "
             f"Unable to load YOLO11n for AMP checks due to possible Ultralytics package modifications. {warning_msg}"
         )
     except AssertionError:
-        LOGGER.warning(
-            f"{prefix}checks failed ❌. Anomalies were detected with AMP on your system that may lead to "
+        LOGGER.error(
+            f"{prefix}checks failed. Anomalies were detected with AMP on your system that may lead to "
             f"NaN losses or zero-mAP results, so AMP will be disabled during training."
         )
         return False
@@ -771,6 +783,39 @@ def cuda_is_available() -> bool:
         (bool): True if one or more NVIDIA GPUs are available, False otherwise.
     """
     return cuda_device_count() > 0
+
+
+def is_rockchip():
+    """
+    Check if the current environment is running on a Rockchip SoC.
+
+    Returns:
+        (bool): True if running on a Rockchip SoC, False otherwise.
+    """
+    if LINUX and ARM64:
+        try:
+            with open("/proc/device-tree/compatible") as f:
+                dev_str = f.read()
+                *_, soc = dev_str.split(",")
+                if soc.replace("\x00", "") in RKNN_CHIPS:
+                    return True
+        except OSError:
+            return False
+    else:
+        return False
+
+
+def is_sudo_available() -> bool:
+    """
+    Check if the sudo command is available in the environment.
+
+    Returns:
+        (bool): True if the sudo command is available, False otherwise.
+    """
+    if WINDOWS:
+        return False
+    cmd = "sudo --version"
+    return subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 # Run checks and define constants

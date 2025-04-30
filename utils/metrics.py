@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from utils import LOGGER, SimpleClass, TryExcept, plt_settings
+from utils import LOGGER, SimpleClass, TryExcept,checks,  plt_settings
 
 OKS_SIGMA = (
     np.array([0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
@@ -270,7 +270,7 @@ def batch_probiou(obb1, obb2, eps=1e-7):
     return 1 - hd
 
 
-def smooth_BCE(eps=0.1):
+def smooth_bce(eps=0.1):
     """
     Computes smoothed positive and negative Binary Cross-Entropy targets.
 
@@ -372,10 +372,9 @@ class ConfusionMatrix:
             else:
                 self.matrix[self.nc, gc] += 1  # true background
 
-        if n:
-            for i, dc in enumerate(detection_classes):
-                if not any(m1 == i):
-                    self.matrix[dc, self.nc] += 1  # predicted background
+        for i, dc in enumerate(detection_classes):
+            if not any(m1 == i):
+                self.matrix[dc, self.nc] += 1  # predicted background
 
     def matrix(self):
         """Returns the confusion matrix."""
@@ -388,7 +387,7 @@ class ConfusionMatrix:
         # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
         return (tp[:-1], fp[:-1]) if self.task == "detect" else (tp, fp)  # remove background class if task=detect
 
-    @TryExcept("WARNING ⚠️ ConfusionMatrix plot failure")
+    @TryExcept(msg="ConfusionMatrix plot failure")
     @plt_settings()
     def plot(self, normalize=True, save_dir="", names=(), on_plot=None):
         """
@@ -428,7 +427,7 @@ class ConfusionMatrix:
         ax.set_xlabel("True")
         ax.set_ylabel("Predicted")
         ax.set_title(title)
-        plot_fname = Path(save_dir) / f'{title.lower().replace(" ", "_")}.png'
+        plot_fname = Path(save_dir) / f"{title.lower().replace(' ', '_')}.png"
         fig.savefig(plot_fname, dpi=250)
         plt.close(fig)
         if on_plot:
@@ -436,7 +435,7 @@ class ConfusionMatrix:
 
     def print(self):
         """Print the confusion matrix to the console."""
-        for i in range(self.nc + 1):
+        for i in range(self.matrix.shape[0]):
             LOGGER.info(" ".join(map(str, self.matrix[i])))
 
 
@@ -484,7 +483,7 @@ def plot_mc_curve(px, py, save_dir=Path("mc_curve.png"), names={}, xlabel="Confi
     else:
         ax.plot(px, py.T, linewidth=1, color="grey")  # plot(confidence, metric)
 
-    y = smooth(py.mean(0), 0.05)
+    y = smooth(py.mean(0), 0.1)
     ax.plot(px, y, linewidth=3, color="blue", label=f"all classes {y.max():.2f} at {px[y.argmax()]:.3f}")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -522,7 +521,8 @@ def compute_ap(recall, precision):
     method = "interp"  # methods: 'continuous', 'interp'
     if method == "interp":
         x = np.linspace(0, 1, 101)  # 101-point interp (COCO)
-        ap = np.trapz(np.interp(x, mrec, mpre), x)  # integrate
+        func = np.trapezoid if checks.check_version(np.__version__, ">=2.0") else np.trapz  # np.trapz deprecated
+        ap = func(np.interp(x, mrec, mpre), x)  # integrate
     else:  # 'continuous'
         i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x-axis (recall) changes
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve
@@ -601,7 +601,7 @@ def ap_per_class(
             if j == 0:
                 prec_values.append(np.interp(x, mrec, mpre))  # precision at mAP@0.5
 
-    prec_values = np.array(prec_values)  # (nc, 1000)
+    prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))  # (nc, 1000)
 
     # Compute F1 (harmonic mean of precision and recall)
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
@@ -805,37 +805,40 @@ class DetMetrics(SimpleClass):
 
     Attributes:
         save_dir (Path): A path to the directory where the output plots will be saved.
-        plot (bool): A flag that indicates whether to plot the precision-recall curves for each class.
-        on_plot (func): An optional callback to pass plots path and data when they are rendered.
-        names (dict of str): A dict of strings that represents the names of the classes.
-        box (Metric): An instance of the Metric class for storing the results of the detection metrics.
-        speed (dict): A dictionary for storing the execution time of different parts of the detection process.
-
-    Methods:
-        process(tp, conf, pred_cls, target_cls): Updates the metric results with the latest batch of predictions.
-        keys: Returns a list of keys for accessing the computed detection metrics.
-        mean_results: Returns a list of mean values for the computed detection metrics.
-        class_result(i): Returns a list of values for the computed detection metrics for a specific class.
-        maps: Returns a dictionary of mean average precision (mAP) values for different IoU thresholds.
-        fitness: Computes the fitness score based on the computed detection metrics.
-        ap_class_index: Returns a list of class indices sorted by their average precision (AP) values.
-        results_dict: Returns a dictionary that maps detection metric keys to their computed values.
-        curves: TODO
-        curves_results: TODO
+        plot (bool): A flag that indicates whether to plot precision-recall curves for each class.
+        names (dict): A dictionary of class names.
+        box (Metric): An instance of the Metric class for storing detection results.
+        speed (dict): A dictionary for storing execution times of different parts of the detection process.
+        task (str): The task type, set to 'detect'.
     """
 
-    def __init__(self, save_dir=Path("."), plot=False, on_plot=None, names={}) -> None:
-        """Initialize a DetMetrics instance with a save directory, plot flag, callback function, and class names."""
+    def __init__(self, save_dir=Path("."), plot=False, names={}) -> None:
+        """
+        Initialize a DetMetrics instance with a save directory, plot flag, and class names.
+
+        Args:
+            save_dir (Path, optional): Directory to save plots.
+            plot (bool, optional): Whether to plot precision-recall curves.
+            names (dict, optional): Dictionary mapping class indices to names.
+        """
         self.save_dir = save_dir
         self.plot = plot
-        self.on_plot = on_plot
         self.names = names
         self.box = Metric()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "detect"
 
-    def process(self, tp, conf, pred_cls, target_cls):
-        """Process predicted results for object detection and update metrics."""
+    def process(self, tp, conf, pred_cls, target_cls, on_plot=None):
+        """
+        Process predicted results for object detection and update metrics.
+
+        Args:
+            tp (np.ndarray): True positive array.
+            conf (np.ndarray): Confidence array.
+            pred_cls (np.ndarray): Predicted class indices array.
+            target_cls (np.ndarray): Target class indices array.
+            on_plot (callable, optional): Function to call after plots are generated.
+        """
         results = ap_per_class(
             tp,
             conf,
@@ -844,7 +847,7 @@ class DetMetrics(SimpleClass):
             plot=self.plot,
             save_dir=self.save_dir,
             names=self.names,
-            on_plot=self.on_plot,
+            on_plot=on_plot,
         )[2:]
         self.box.nc = len(self.names)
         self.box.update(results)
@@ -911,29 +914,27 @@ class SegmentMetrics(SimpleClass):
         box (Metric): An instance of the Metric class to calculate box detection metrics.
         seg (Metric): An instance of the Metric class to calculate mask segmentation metrics.
         speed (dict): Dictionary to store the time taken in different phases of inference.
-
-    Methods:
-        process(tp_m, tp_b, conf, pred_cls, target_cls): Processes metrics over the given set of predictions.
-        mean_results(): Returns the mean of the detection and segmentation metrics over all the classes.
-        class_result(i): Returns the detection and segmentation metrics of class `i`.
-        maps: Returns the mean Average Precision (mAP) scores for IoU thresholds ranging from 0.50 to 0.95.
-        fitness: Returns the fitness scores, which are a single weighted combination of metrics.
-        ap_class_index: Returns the list of indices of classes used to compute Average Precision (AP).
-        results_dict: Returns the dictionary containing all the detection and segmentation metrics and fitness score.
+        task (str): The task type, set to 'segment'.
     """
 
-    def __init__(self, save_dir=Path("."), plot=False, on_plot=None, names=()) -> None:
-        """Initialize a SegmentMetrics instance with a save directory, plot flag, callback function, and class names."""
+    def __init__(self, save_dir=Path("."), plot=False, names=()) -> None:
+        """
+        Initialize a SegmentMetrics instance with a save directory, plot flag, and class names.
+
+        Args:
+            save_dir (Path, optional): Directory to save plots.
+            plot (bool, optional): Whether to plot precision-recall curves.
+            names (dict, optional): Dictionary mapping class indices to names.
+        """
         self.save_dir = save_dir
         self.plot = plot
-        self.on_plot = on_plot
         self.names = names
         self.box = Metric()
         self.seg = Metric()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "segment"
 
-    def process(self, tp, tp_m, conf, pred_cls, target_cls):
+    def process(self, tp, tp_m, conf, pred_cls, target_cls, on_plot=None):
         """
         Processes the detection and segmentation metrics over the given set of predictions.
 
@@ -950,7 +951,7 @@ class SegmentMetrics(SimpleClass):
             pred_cls,
             target_cls,
             plot=self.plot,
-            on_plot=self.on_plot,
+            on_plot=on_plot,
             save_dir=self.save_dir,
             names=self.names,
             prefix="Mask",
@@ -963,7 +964,7 @@ class SegmentMetrics(SimpleClass):
             pred_cls,
             target_cls,
             plot=self.plot,
-            on_plot=self.on_plot,
+            on_plot=on_plot,
             save_dir=self.save_dir,
             names=self.names,
             prefix="Box",
@@ -1062,19 +1063,25 @@ class PoseMetrics(SegmentMetrics):
         results_dict: Returns the dictionary containing all the detection and segmentation metrics and fitness score.
     """
 
-    def __init__(self, save_dir=Path("."), plot=False, on_plot=None, names=()) -> None:
-        """Initialize the PoseMetrics class with directory path, class names, and plotting options."""
+    def __init__(self, save_dir=Path("."), plot=False, names=()) -> None:
+        """
+        Initialize the PoseMetrics class with directory path, class names, and plotting options.
+
+        Args:
+            save_dir (Path, optional): Directory to save plots.
+            plot (bool, optional): Whether to plot precision-recall curves.
+            names (dict, optional): Dictionary mapping class indices to names.
+        """
         super().__init__(save_dir, plot, names)
         self.save_dir = save_dir
         self.plot = plot
-        self.on_plot = on_plot
         self.names = names
         self.box = Metric()
         self.pose = Metric()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "pose"
 
-    def process(self, tp, tp_p, conf, pred_cls, target_cls):
+    def process(self, tp, tp_p, conf, pred_cls, target_cls, on_plot=None):
         """
         Processes the detection and pose metrics over the given set of predictions.
 
@@ -1091,7 +1098,7 @@ class PoseMetrics(SegmentMetrics):
             pred_cls,
             target_cls,
             plot=self.plot,
-            on_plot=self.on_plot,
+            on_plot=on_plot,
             save_dir=self.save_dir,
             names=self.names,
             prefix="Pose",
@@ -1104,7 +1111,7 @@ class PoseMetrics(SegmentMetrics):
             pred_cls,
             target_cls,
             plot=self.plot,
-            on_plot=self.on_plot,
+            on_plot=on_plot,
             save_dir=self.save_dir,
             names=self.names,
             prefix="Box",
@@ -1223,17 +1230,32 @@ class ClassifyMetrics(SimpleClass):
 class OBBMetrics(SimpleClass):
     """Metrics for evaluating oriented bounding box (OBB) detection, see https://arxiv.org/pdf/2106.06072.pdf."""
 
-    def __init__(self, save_dir=Path("."), plot=False, on_plot=None, names=()) -> None:
-        """Initialize an OBBMetrics instance with directory, plotting, callback, and class names."""
+    def __init__(self, save_dir=Path("."), plot=False, names=()) -> None:
+        """
+        Initialize an OBBMetrics instance with directory, plotting, and class names.
+
+        Args:
+            save_dir (Path, optional): Directory to save plots.
+            plot (bool, optional): Whether to plot precision-recall curves.
+            names (dict, optional): Dictionary mapping class indices to names.
+        """
         self.save_dir = save_dir
         self.plot = plot
-        self.on_plot = on_plot
         self.names = names
         self.box = Metric()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
 
-    def process(self, tp, conf, pred_cls, target_cls):
-        """Process predicted results for object detection and update metrics."""
+    def process(self, tp, conf, pred_cls, target_cls, on_plot=None):
+        """
+        Process predicted results for object detection and update metrics.
+
+        Args:
+            tp (np.ndarray): True positive array.
+            conf (np.ndarray): Confidence array.
+            pred_cls (np.ndarray): Predicted class indices array.
+            target_cls (np.ndarray): Target class indices array.
+            on_plot (callable, optional): Function to call after plots are generated.
+        """
         results = ap_per_class(
             tp,
             conf,
@@ -1242,7 +1264,7 @@ class OBBMetrics(SimpleClass):
             plot=self.plot,
             save_dir=self.save_dir,
             names=self.names,
-            on_plot=self.on_plot,
+            on_plot=on_plot,
         )[2:]
         self.box.nc = len(self.names)
         self.box.update(results)

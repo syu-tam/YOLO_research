@@ -4,7 +4,7 @@ import contextlib
 import importlib.metadata
 import inspect
 import json
-import logging.config
+import logging
 import os
 import platform
 import re
@@ -12,20 +12,23 @@ import subprocess
 import sys
 import threading
 import time
-import urllib
 import uuid
+import warnings
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 from typing import Union
+from urllib.parse import unquote
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import tqdm
 import yaml
 from tqdm import tqdm as tqdm_original
 
+from .patches import imread, imshow, imwrite, torch_load, torch_save  # for patches
 
 # PyTorch Multi-GPU DDP Constants
 RANK = int(os.getenv("RANK", -1))
@@ -108,16 +111,18 @@ HELP_MSG = """
 
 # Settings and Environment Variables
 torch.set_printoptions(linewidth=320, precision=4, profile="default")
-np.set_printoptions(linewidth=320, formatter={"float_kind": "{:11.5g}".format})  # format short g, %precision=5
+np.set_printoptions(linewidth=320, formatter=dict(float_kind="{:11.5g}".format))  # format short g, %precision=5
 cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
 os.environ["NUMEXPR_MAX_THREADS"] = str(NUM_THREADS)  # NumExpr max threads
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic training to avoid CUDA warning
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress verbose TF compiler warnings in Colab
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"  # suppress "NNPACK.cpp could not initialize NNPACK" warnings
 os.environ["KINETO_LOG_LEVEL"] = "5"  # suppress verbose PyTorch profiler output when computing FLOPs
 
+if TQDM_RICH := str(os.getenv("YOLO_TQDM_RICH", False)).lower() == "true":
+    from tqdm import rich
 
-class TQDM(tqdm_original):
+
+class TQDM(rich.tqdm if TQDM_RICH else tqdm.tqdm):
     """
     A custom TQDM progress bar class that extends the original tqdm functionality.
 
@@ -160,7 +165,8 @@ class TQDM(tqdm_original):
             ...     # Your code here
             ...     pass
         """
-        kwargs["disable"] = not VERBOSE or kwargs.get("disable", False)  # logical 'and' with default value if passed
+        warnings.filterwarnings("ignore", category=tqdm.TqdmExperimentalWarning)  # suppress tqdm.rich warning
+        kwargs["disable"] = not VERBOSE or kwargs.get("disable", False)
         kwargs.setdefault("bar_format", TQDM_BAR_FORMAT)  # override default value if passed
         super().__init__(*args, **kwargs)
 
@@ -349,15 +355,25 @@ def set_logging(name="LOGGING_NAME", verbose=True):
     """
     level = logging.INFO if verbose and RANK in {-1, 0} else logging.ERROR  # rank in world for Multi-GPU trainings
 
-    # Configure the console (stdout) encoding to UTF-8, with checks for compatibility
-    formatter = logging.Formatter("%(message)s")  # Default formatter
+    class PrefixFormatter(logging.Formatter):
+        def format(self, record):
+            """Format log records with prefixes based on level."""
+            # Apply prefixes based on log level
+            if record.levelno == logging.WARNING:
+                prefix = "WARNING ⚠️" if not WINDOWS else "WARNING"
+                record.msg = f"{prefix} {record.msg}"
+            elif record.levelno == logging.ERROR:
+                prefix = "ERROR ❌" if not WINDOWS else "ERROR"
+                record.msg = f"{prefix} {record.msg}"
+
+            # Handle emojis in message based on platform
+            formatted_message = super().format(record)
+            return emojis(formatted_message)
+
+    formatter = PrefixFormatter("%(message)s")
+
+    # Handle Windows UTF-8 encoding issues
     if WINDOWS and hasattr(sys.stdout, "encoding") and sys.stdout.encoding != "utf-8":
-
-        class CustomFormatter(logging.Formatter):
-            def format(self, record):
-                """Sets up logging with UTF-8 encoding and configurable verbosity."""
-                return emojis(super().format(record))
-
         try:
             # Attempt to reconfigure stdout to use UTF-8 encoding if possible
             if hasattr(sys.stdout, "reconfigure"):
@@ -367,11 +383,8 @@ def set_logging(name="LOGGING_NAME", verbose=True):
                 import io
 
                 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-            else:
-                formatter = CustomFormatter("%(message)s")
-        except Exception as e:
-            print(f"Creating custom formatter for non UTF-8 environments due to {e}")
-            formatter = CustomFormatter("%(message)s")
+        except Exception:
+            pass
 
     # Create and configure the StreamHandler with the appropriate formatter and level
     stream_handler = logging.StreamHandler(sys.stdout)
@@ -524,11 +537,7 @@ def read_device_model() -> str:
     Returns:
         (str): Model file contents if read successfully or empty string otherwise.
     """
-    try:
-        with open("/proc/device-tree/model") as f:
-            return f.read()
-    except Exception:
-        return ""
+    return platform.release().lower()
 
 
 def is_ubuntu() -> bool:
@@ -600,7 +609,7 @@ def is_raspberrypi() -> bool:
     Returns:
         (bool): True if running on a Raspberry Pi, False otherwise.
     """
-    return "Raspberry Pi" in PROC_DEVICE_MODEL
+    return "rpi" in DEVICE_MODEL
 
 
 def is_jetson() -> bool:
@@ -611,7 +620,7 @@ def is_jetson() -> bool:
     Returns:
         (bool): True if running on a Jetson Nano or Jetson Orin, False otherwise.
     """
-    return "NVIDIA" in PROC_DEVICE_MODEL  # i.e. "NVIDIA Jetson Nano" or "NVIDIA Orin NX"
+    return "tegra" in DEVICE_MODEL
 
 
 def is_online() -> bool:
@@ -801,7 +810,7 @@ def get_user_config_dir(sub_dir="Ultralytics"):
 
 
 # Define constants (required below)
-PROC_DEVICE_MODEL = read_device_model()  # is_jetson() and is_raspberrypi() depend on this constant
+DEVICE_MODEL = read_device_model()  # is_jetson() and is_raspberrypi() depend on this constant
 ONLINE = is_online()
 IS_COLAB = is_colab()
 IS_KAGGLE = is_kaggle()
@@ -916,7 +925,7 @@ class TryExcept(contextlib.ContextDecorator):
     def __exit__(self, exc_type, value, traceback):
         """Defines behavior when exiting a 'with' block, prints error message if necessary."""
         if self.verbose and value:
-            print(emojis(f"{self.msg}{': ' if self.msg else ''}{value}"))
+            LOGGER.warning(f"{self.msg}{': ' if self.msg else ''}{value}")
         return True
 
 
@@ -952,7 +961,7 @@ class Retry(contextlib.ContextDecorator):
                     return func(*args, **kwargs)
                 except Exception as e:
                     self._attempts += 1
-                    print(f"Retry {self._attempts}/{self.times} failed: {e}")
+                    LOGGER.warning(f"Retry {self._attempts}/{self.times} failed: {e}")
                     if self._attempts >= self.times:
                         raise e
                     time.sleep(self.delay * (2**self._attempts))  # exponential backoff delay
@@ -1045,7 +1054,7 @@ def set_sentry():
         auto_enabling_integrations=False,
         traces_sample_rate=1.0,
         release=__version__,
-        environment="production",  # 'dev' or 'production'
+        environment="runpod" if is_runpod() else "production",
         before_send=before_send,
         ignore_errors=[KeyboardInterrupt, FileNotFoundError],
     )
@@ -1095,18 +1104,18 @@ class JSONDict(dict):
                 with open(self.file_path) as f:
                     self.update(json.load(f))
         except json.JSONDecodeError:
-            print(f"Error decoding JSON from {self.file_path}. Starting with an empty dictionary.")
+            LOGGER.warning(f"Error decoding JSON from {self.file_path}. Starting with an empty dictionary.")
         except Exception as e:
-            print(f"Error reading from {self.file_path}: {e}")
+            LOGGER.error(f"Error reading from {self.file_path}: {e}")
 
     def _save(self):
         """Save the current state of the dictionary to the JSON file."""
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.file_path, "w") as f:
+            with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump(dict(self), f, indent=2, default=self._json_default)
         except Exception as e:
-            print(f"Error writing to {self.file_path}: {e}")
+            LOGGER.error(f"Error writing to {self.file_path}: {e}")
 
     @staticmethod
     def _json_default(obj):
@@ -1129,7 +1138,8 @@ class JSONDict(dict):
 
     def __str__(self):
         """Return a pretty-printed JSON string representation of the dictionary."""
-        return f'JSONDict("{self.file_path}"):\n{json.dumps(dict(self), indent=2, ensure_ascii=False, default=self._json_default)}'
+        contents = json.dumps(dict(self), indent=2, ensure_ascii=False, default=self._json_default)
+        return f'JSONDict("{self.file_path}"):\n{contents}'
 
     def update(self, *args, **kwargs):
         """Update the dictionary and persist changes."""
@@ -1197,8 +1207,8 @@ class SettingsManager(JSONDict):
             "mlflow": True,  # MLflow integration
             "neptune": True,  # Neptune integration
             "raytune": True,  # Ray Tune integration
-            "tensorboard": True,  # TensorBoard logging
-            "wandb": True,  # Weights & Biases logging
+            "tensorboard": False,  # TensorBoard logging
+            "wandb": False,  # Weights & Biases logging
             "vscode_msg": True,  # VSCode messaging
         }
 
@@ -1208,7 +1218,7 @@ class SettingsManager(JSONDict):
             "For help see https://docs.ultralytics.com/quickstart/#ultralytics-settings."
         )
 
-        with torch_distributed_zero_first(RANK):
+        with torch_distributed_zero_first(LOCAL_RANK):
             super().__init__(self.file)
 
             if not self.file.exists() or not self:  # Check if file doesn't exist or is empty
@@ -1219,32 +1229,41 @@ class SettingsManager(JSONDict):
 
     def _validate_settings(self):
         """Validate the current settings and reset if necessary."""
-        correct_keys = set(self.keys()) == set(self.defaults.keys())
+        correct_keys = frozenset(self.keys()) == frozenset(self.defaults.keys())
         correct_types = all(isinstance(self.get(k), type(v)) for k, v in self.defaults.items())
         correct_version = self.get("settings_version", "") == self.version
 
         if not (correct_keys and correct_types and correct_version):
             LOGGER.warning(
-                "WARNING ⚠️ Ultralytics settings reset to default values. This may be due to a possible problem "
+                "Ultralytics settings reset to default values. This may be due to a possible problem "
                 f"with your settings or a recent ultralytics package update. {self.help_msg}"
             )
             self.reset()
 
         if self.get("datasets_dir") == self.get("runs_dir"):
             LOGGER.warning(
-                f"WARNING ⚠️ Ultralytics setting 'datasets_dir: {self.get('datasets_dir')}' "
+                f"Ultralytics setting 'datasets_dir: {self.get('datasets_dir')}' "
                 f"must be different than 'runs_dir: {self.get('runs_dir')}'. "
                 f"Please change one to avoid possible issues during training. {self.help_msg}"
             )
 
+    def __setitem__(self, key, value):
+        """Updates one key: value pair."""
+        self.update({key: value})
+
     def update(self, *args, **kwargs):
         """Updates settings, validating keys and types."""
+        for arg in args:
+            if isinstance(arg, dict):
+                kwargs.update(arg)
         for k, v in kwargs.items():
             if k not in self.defaults:
                 raise KeyError(f"No Ultralytics setting '{k}'. {self.help_msg}")
             t = type(self.defaults[k])
             if not isinstance(v, t):
-                raise TypeError(f"Ultralytics setting '{k}' must be of type '{t}', not '{type(v)}'. {self.help_msg}")
+                raise TypeError(
+                    f"Ultralytics setting '{k}' must be '{t.__name__}' type, not '{type(v).__name__}'. {self.help_msg}"
+                )
         super().update(*args, **kwargs)
 
     def reset(self):
@@ -1253,15 +1272,18 @@ class SettingsManager(JSONDict):
         self.update(self.defaults)
 
 
-def deprecation_warn(arg, new_arg):
+def deprecation_warn(arg, new_arg=None):
     """Issue a deprecation warning when a deprecated argument is used, suggesting an updated argument."""
-    LOGGER.warning(f"WARNING ⚠️ '{arg}' is deprecated and will be removed in in the future. Use '{new_arg}' instead.")
+    msg = f"'{arg}' is deprecated and will be removed in in the future."
+    if new_arg is not None:
+        msg += f" Use '{new_arg}' instead."
+    LOGGER.warning(msg)
 
 
 def clean_url(url):
     """Strip auth from URL, i.e. https://url.com/file.txt?auth -> https://url.com/file.txt."""
     url = Path(url).as_posix().replace(":/", "://")  # Pathlib turns :// -> :/, as_posix() for Windows
-    return urllib.parse.unquote(url).split("?")[0]  # '%2F' to '/', split https://url.com/file.txt?auth
+    return unquote(url).split("?")[0]  # '%2F' to '/', split https://url.com/file.txt?auth
 
 
 def url2file(url):
@@ -1302,8 +1324,6 @@ TESTS_RUNNING = is_pytest_running() or is_github_action_running()
 set_sentry()
 
 # Apply monkey patches
-from utils.patches import imread, imshow, imwrite, torch_load, torch_save
-
 torch.load = torch_load
 torch.save = torch_save
 if WINDOWS:

@@ -305,7 +305,7 @@ class Results(SimpleClass):
             if v is not None:
                 return len(v)
 
-    def update(self, boxes=None, masks=None, probs=None, obb=None):
+    def update(self, boxes=None, masks=None, probs=None, obb=None, keypoints=None):
         """
         Updates the Results object with new detection data.
 
@@ -332,6 +332,8 @@ class Results(SimpleClass):
             self.probs = probs
         if obb is not None:
             self.obb = OBB(obb, self.orig_shape)
+        if keypoints is not None:
+            self.keypoints = Keypoints(keypoints, self.orig_shape)
 
     def _apply(self, fn, *args, **kwargs):
         """
@@ -462,6 +464,7 @@ class Results(SimpleClass):
         save=False,
         filename=None,
         color_mode="class",
+        txt_color=(255, 255, 255),
     ):
         """
         Plots detection results on an input RGB image.
@@ -535,9 +538,9 @@ class Results(SimpleClass):
         # Plot Detect results
         if pred_boxes is not None and show_boxes:
             for i, d in enumerate(reversed(pred_boxes)):
-                c, conf, id = int(d.cls), float(d.conf) if conf else None, None if d.id is None else int(d.id.item())
+                c, d_conf, id = int(d.cls), float(d.conf) if conf else None, None if d.id is None else int(d.id.item())
                 name = ("" if id is None else f"id:{id} ") + names[c]
-                label = (f"{name} {conf:.2f}" if conf else name) if labels else None
+                label = (f"{name} {d_conf:.2f}" if conf else name) if labels else None
                 box = d.xyxyxyxy.reshape(-1, 4, 2).squeeze() if is_obb else d.xyxy.squeeze()
                 annotator.box_label(
                     box,
@@ -557,9 +560,9 @@ class Results(SimpleClass):
 
         # Plot Classify results
         if pred_probs is not None and show_probs:
-            text = ",\n".join(f"{names[j] if names else j} {pred_probs.data[j]:.2f}" for j in pred_probs.top5)
+            text = "\n".join(f"{names[j] if names else j} {pred_probs.data[j]:.2f}" for j in pred_probs.top5)
             x = round(self.orig_shape[0] * 0.03)
-            annotator.text([x, x], text, txt_color=(255, 255, 255))  # TODO: allow setting colors
+            annotator.text([x, x], text, txt_color=txt_color, box_color=(64, 64, 64, 128))  # RGBA box
 
         # Plot Pose results
         if self.keypoints is not None:
@@ -578,9 +581,9 @@ class Results(SimpleClass):
 
         # Save results
         if save:
-            annotator.save(filename)
+            annotator.save(filename or f"results_{Path(self.path).name}")
 
-        return annotator.result()
+        return annotator.im if pil else annotator.result()
 
     def show(self, *args, **kwargs):
         """
@@ -652,12 +655,11 @@ class Results(SimpleClass):
         """
         log_string = ""
         probs = self.probs
-        boxes = self.boxes
         if len(self) == 0:
             return log_string if probs is not None else f"{log_string}(no detections), "
         if probs is not None:
             log_string += f"{', '.join(f'{self.names[j]} {probs.data[j]:.2f}' for j in probs.top5)}, "
-        if boxes:
+        if boxes := self.boxes:
             for c in boxes.cls.unique():
                 n = (boxes.cls == c).sum()  # detections per class
                 log_string += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "
@@ -715,7 +717,7 @@ class Results(SimpleClass):
 
         if texts:
             Path(txt_file).parent.mkdir(parents=True, exist_ok=True)  # make directory
-            with open(txt_file, "a") as f:
+            with open(txt_file, "a", encoding="utf-8") as f:
                 f.writelines(text + "\n" for text in texts)
 
     def save_crop(self, save_dir, file_name=Path("im.jpg")):
@@ -750,7 +752,7 @@ class Results(SimpleClass):
             save_one_box(
                 d.xyxy,
                 self.orig_img.copy(),
-                file=Path(save_dir) / self.names[int(d.cls)] / f"{Path(file_name)}.jpg",
+                file=Path(save_dir) / self.names[int(d.cls)] / Path(file_name).with_suffix(".jpg"),
                 BGR=True,
             )
 
@@ -897,6 +899,34 @@ class Results(SimpleClass):
         df = self.to_df(normalize=normalize, decimals=decimals)
         return '<?xml version="1.0" encoding="utf-8"?>\n<root></root>' if df.empty else df.to_xml(*args, **kwargs)
 
+    def to_html(self, normalize=False, decimals=5, index=False, *args, **kwargs):
+        """
+        Converts detection results to HTML format.
+
+        This method serializes the detection results into an HTML format. It includes information
+        about detected objects such as bounding boxes, class names, confidence scores, and optionally
+        segmentation masks and keypoints.
+
+        Args:
+            normalize (bool): Whether to normalize the bounding box coordinates by the image dimensions.
+                If True, coordinates will be returned as float values between 0 and 1.
+            decimals (int): Number of decimal places to round the output values to.
+            index (bool): Whether to include the DataFrame index in the HTML output.
+            *args (Any): Variable length argument list to be passed to pandas.DataFrame.to_html().
+            **kwargs (Any): Arbitrary keyword arguments to be passed to pandas.DataFrame.to_html().
+
+        Returns:
+            (str): An HTML string containing all the information in results in an organized way.
+
+        Examples:
+            >>> results = model("path/to/image.jpg")
+            >>> for result in results:
+            >>>     html_result = result.to_html()
+            >>>     print(html_result)
+        """
+        df = self.to_df(normalize=normalize, decimals=decimals)
+        return "<table></table>" if df.empty else df.to_html(index=index, *args, **kwargs)
+
     def tojson(self, normalize=False, decimals=5):
         """Deprecated version of to_json()."""
         LOGGER.warning("WARNING ⚠️ 'result.tojson()' is deprecated, replace with 'result.to_json()'.")
@@ -934,6 +964,64 @@ class Results(SimpleClass):
         import json
 
         return json.dumps(self.summary(normalize=normalize, decimals=decimals), indent=2)
+
+    def to_sql(self, table_name="results", normalize=False, decimals=5, db_path="results.db"):
+        """
+        Converts detection results to an SQL-compatible format.
+
+        This method serializes the detection results into a format compatible with SQL databases.
+        It includes information about detected objects such as bounding boxes, class names, confidence scores,
+        and optionally segmentation masks, keypoints or oriented bounding boxes.
+
+        Args:
+            table_name (str): Name of the SQL table where the data will be inserted.
+            normalize (bool): Whether to normalize the bounding box coordinates by the image dimensions.
+                If True, coordinates will be returned as float values between 0 and 1.
+            decimals (int): Number of decimal places to round the bounding boxes values to.
+            db_path (str): Path to the SQLite database file.
+
+        Examples:
+            >>> results = model("path/to/image.jpg")
+            >>> for result in results:
+            >>>     result.to_sql()
+        """
+        import json
+        import sqlite3
+
+        # Convert results to a list of dictionaries
+        data = self.summary(normalize=normalize, decimals=decimals)
+        if len(data) == 0:
+            LOGGER.warning("No results to save to SQL. Results dict is empty.")
+            return
+
+        # Connect to the SQLite database
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Create table if it doesn't exist
+        columns = (
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, class_name TEXT, confidence REAL, box TEXT, masks TEXT, kpts TEXT"
+        )
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({columns})")
+
+        # Insert data into the table
+        for item in data:
+            cursor.execute(
+                f"INSERT INTO {table_name} (class_name, confidence, box, masks, kpts) VALUES (?, ?, ?, ?, ?)",
+                (
+                    item.get("name"),
+                    item.get("confidence"),
+                    json.dumps(item.get("box", {})),
+                    json.dumps(item.get("segments", {})),
+                    json.dumps(item.get("keypoints", {})),
+                ),
+            )
+
+        # Commit and close the connection
+        conn.commit()
+        conn.close()
+
+        LOGGER.info(f"✅ Detection results successfully written to SQL table '{table_name}' in database '{db_path}'.")
 
 
 class Boxes(BaseTensor):

@@ -18,15 +18,15 @@ seed = args.seed
 mode = "train"
 method = 'yolov11'
 model_size = 'n'
-data = "VOC.yaml"
+data = "coco.yaml"
 batch = 64
 epochs = 500
 patience = 50
 is_wandb = True
 
 # 保存先設定
-train_project = os.path.join(f"result/v{method.replace('yolov', '')}/train/{model_size}")
-val_project = os.path.join(f"result/v{method.replace('yolov', '')}/val/{model_size}")
+train_project = os.path.join(f"result/v{method.replace('yolov', '')}/{data.replace('.yaml', '')}/{model_size}/LD(t=1)")
+val_project = os.path.join(f"result/v{method.replace('yolov', '')}/{data.replace('.yaml', '')}/{model_size}/LD(t=1)")
 name = f"{model_size}_seed{seed}"
 
 # モデル設定ファイル
@@ -39,7 +39,7 @@ if mode == 'train':
     if not is_wandb:
         os.environ["WANDB_DISABLED"] = "true"
 
-    wandb.init(project="YOLO", name=f"{method.replace('yolov', 'v')}_{model_size}_seed{seed}")
+    wandb.init(project=f"{data.replace('.yaml', '')}", name=f"{method.replace('yolov', 'v')}_{model_size}_seed{seed}_LD(t=1)")
 
     if 'yolo' in method:
         model = YOLO(model_config, task='detect')

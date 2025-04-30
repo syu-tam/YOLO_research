@@ -2,7 +2,7 @@
 
 import inspect  # モジュール内のオブジェクトに関する情報を取得するためのモジュール
 from pathlib import Path  # ファイルやディレクトリをオブジェクトとして扱うためのモジュール
-from typing import List, Union  # 型ヒントで使用するためのモジュール
+from typing import List, Union, Any, Dict  # 型ヒントで使用するためのモジュール
 
 import numpy as np  # 数値計算ライブラリ
 import torch  # PyTorch深層学習フレームワーク
@@ -21,7 +21,6 @@ from utils import (  # ユーティリティ関数をインポート
     SETTINGS,  # 設定
     callbacks,  # コールバック関数
     checks,  # チェック関数
-    emojis,  # 絵文字
     yaml_load,  # YAMLファイルのロード関数
 )
 
@@ -120,6 +119,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
             self._new(model, task=task, verbose=verbose)  # 新しいモデルを初期化
         else:  # モデルのパスがYAMLファイルではない場合
             self._load(model, task=task)  # モデルをロード
+        del self.training
 
     def __call__(
         self,
@@ -398,7 +398,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
         source: Union[str, Path, int, Image.Image, list, tuple, np.ndarray, torch.Tensor] = None,  # 入力ソース。ファイルパス、URL、PILイメージ、numpy配列、torchテンソルなど
         stream: bool = False,  # ストリーミングモードで処理するかどうか。デフォルトはFalse
         predictor=None,  # カスタムpredictor。デフォルトはNone
-        **kwargs,  # その他のキーワード引数
+        **kwargs: Any,  # その他のキーワード引数
     ) -> List[Results]:
         """
         YOLOモデルを使用して、指定された画像ソースで予測を実行します。
@@ -504,7 +504,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
     def val(
         self,
         validator=None,  # カスタムvalidator。デフォルトはNone
-        **kwargs,  # その他のキーワード引数
+        **kwargs: Any,  # その他のキーワード引数
     ):
         """
         指定されたデータセットと検証構成を使用してモデルを検証します。
@@ -538,7 +538,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
 
     def benchmark(
         self,
-        **kwargs,  # その他のキーワード引数
+        **kwargs: Any,  # その他のキーワード引数
     ):
         """
         さまざまなエクスポート形式でモデルをベンチマークして、パフォーマンスを評価します。
@@ -580,12 +580,13 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
             half=args["half"],
             int8=args["int8"],
             device=args["device"],
-            verbose=kwargs.get("verbose"),
+            verbose=kwargs.get("verbose", False),
+            format=kwargs.get("format", ""),
         )
 
     def export(
         self,
-        **kwargs,  # その他のキーワード引数
+        **kwargs: Any,  # その他のキーワード引数
     ) -> str:
         """
         デプロイに適した別の形式にモデルをエクスポートします。
@@ -634,7 +635,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
     def train(
         self,
         trainer=None,  # カスタムtrainer。デフォルトはNone
-        **kwargs,  # その他のキーワード引数
+        **kwargs: Any,  # その他のキーワード引数
     ):
         """
         指定されたデータセットとトレーニング構成を使用してモデルをトレーニングします。
@@ -709,8 +710,8 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
         self,
         use_ray=False,  # Ray Tuneを使用するかどうか。デフォルトはFalse
         iterations=10,  # チューニングの反復回数。デフォルトは10
-        *args,  # 追加の引数
-        **kwargs,  # その他のキーワード引数
+        *args: Any,  # 追加の引数
+        **kwargs: Any,  # その他のキーワード引数
     ):
         """
         Ray Tuneを使用するオプションを使用して、モデルのハイパーパラメータチューニングを実行します。
@@ -776,7 +777,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
         return self  # 更新されたモデルインスタンスを返す
 
     @property
-    def names(self) -> list:
+    def names(self) -> Dict[int, str]:
         """
         ロードされたモデルに関連付けられたクラス名を取得します。
 
@@ -974,9 +975,7 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
         except Exception as e:  # エラーが発生した場合
             name = self.__class__.__name__  # クラス名を取得
             mode = inspect.stack()[1][3]  # 関数名を取得
-            raise NotImplementedError(
-                emojis(f"WARNING ⚠️ '{name}'モデルは、'{self.task}'タスクに対して'{mode}'モードをまだサポートしていません。")
-            ) from e  # NotImplementedErrorを発生
+            raise NotImplementedError(f"WARNING ⚠️ '{name}'モデルは、'{self.task}'タスクに対して'{mode}'モードをまだサポートしていません。") from e  # NotImplementedErrorを発生
 
     @property
     def task_map(self) -> dict:
@@ -1004,3 +1003,45 @@ class Model(nn.Module):  # PyTorchのnn.Moduleを継承したModelクラス
             ドキュメント文字列は、予想される動作と構造の一般的な説明を提供します。
         """
         raise NotImplementedError("モデルのタスクマップを提供してください!")  # task_mapが実装されていない場合、NotImplementedErrorを発生
+    def eval(self):
+        """
+        Sets the model to evaluation mode.
+
+        This method changes the model's mode to evaluation, which affects layers like dropout and batch normalization
+        that behave differently during training and evaluation. In evaluation mode, these layers use running statistics
+        rather than computing batch statistics, and dropout layers are disabled.
+
+        Returns:
+            (Model): The model instance with evaluation mode set.
+
+        Examples:
+            >>> model = YOLO("yolo11n.pt")
+            >>> model.eval()
+            >>> # Model is now in evaluation mode for inference
+        """
+        self.model.eval()
+        return self
+
+    def __getattr__(self, name):
+        """
+        Enable accessing model attributes directly through the Model class.
+
+        This method provides a way to access attributes of the underlying model directly through the Model class
+        instance. It first checks if the requested attribute is 'model', in which case it returns the model from
+        the module dictionary. Otherwise, it delegates the attribute lookup to the underlying model.
+
+        Args:
+            name (str): The name of the attribute to retrieve.
+
+        Returns:
+            (Any): The requested attribute value.
+
+        Raises:
+            AttributeError: If the requested attribute does not exist in the model.
+
+        Examples:
+            >>> model = YOLO("yolo11n.pt")
+            >>> print(model.stride)  # Access model.stride attribute
+            >>> print(model.names)  # Access model.names attribute
+        """
+        return self._modules["model"] if name == "model" else getattr(self.model, name)

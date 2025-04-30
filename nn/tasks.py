@@ -73,6 +73,7 @@ from utils.torch_utils import (
     intersect_dicts,
     model_info,
     scale_img,
+    smart_inference_mode,
     time_sync,
 )
 
@@ -149,7 +150,7 @@ class BaseModel(nn.Module):
         """Perform augmentations on input image x and return augmented inference."""
         # 入力画像xに対して拡張を実行し、拡張された推論を返します。
         LOGGER.warning(
-            f"WARNING ⚠️ {self.__class__.__name__} does not support 'augment=True' prediction. "
+            f"{self.__class__.__name__} does not support 'augment=True' prediction. "
             f"Reverting to single-scale prediction."
         )  # 警告ログを出力
         return self._predict_once(x)  # 一度の予測を実行
@@ -178,29 +179,34 @@ class BaseModel(nn.Module):
             LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")  # ログを出力
 
     def fuse(self, verbose=True):
-        # 計算効率を向上させるために、モデルの`Conv2d（）`レイヤーと`BatchNorm2d（）`レイヤーを単一のレイヤーに融合します。
-        #
-        # 戻り値：
-        #     (nn.Module): 融合されたモデルが返されます。
-        if not self.is_fused():  # 融合されていない場合
-            for m in self.model.modules():  # モデルのモジュールを反復処理
-                if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):  # Conv、Conv2、DWConvであり、bn属性がある場合
-                    if isinstance(m, Conv2):  # Conv2の場合
-                        m.fuse_convs()  # convを融合
-                    m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv。convを更新
-                    delattr(m, "bn")  # remove batchnorm。バッチ正規化を削除
-                    m.forward = m.forward_fuse  # update forward。順方向を更新
-                if isinstance(m, ConvTranspose) and hasattr(m, "bn"):  # ConvTransposeであり、bn属性がある場合
-                    m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)  # 逆畳み込みを融合
-                    delattr(m, "bn")  # remove batchnorm。バッチ正規化を削除
-                    m.forward = m.forward_fuse  # update forward。順方向を更新
-                if isinstance(m, RepConv):  # RepConvの場合
-                    m.fuse_convs()  # convを融合
-                    m.forward = m.forward_fuse  # update forward。順方向を更新
-                if isinstance(m, RepVGGDW):  # RepVGGDWの場合
-                    m.fuse()  # 融合
-                    m.forward = m.forward_fuse  # 順方向を更新
-            self.info(verbose=verbose)  # 情報を出力
+        """
+        Fuse the `Conv2d()` and `BatchNorm2d()` layers of the model into a single layer for improved computation
+        efficiency.
+
+        Returns:
+            (torch.nn.Module): The fused model is returned.
+        """
+        if not self.is_fused():
+            for m in self.model.modules():
+                if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):
+                    if isinstance(m, Conv2):
+                        m.fuse_convs()
+                    m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                    delattr(m, "bn")  # remove batchnorm
+                    m.forward = m.forward_fuse  # update forward
+                if isinstance(m, ConvTranspose) and hasattr(m, "bn"):
+                    m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)
+                    delattr(m, "bn")  # remove batchnorm
+                    m.forward = m.forward_fuse  # update forward
+                if isinstance(m, RepConv):
+                    m.fuse_convs()
+                    m.forward = m.forward_fuse  # update forward
+                if isinstance(m, RepVGGDW):
+                    m.fuse()
+                    m.forward = m.forward_fuse
+                if isinstance(m, v10Detect):
+                    m.fuse()  # remove one2many head
+            self.info(verbose=verbose)
 
         return self  # 自身を返す
 
@@ -294,15 +300,14 @@ class DetectionModel(BaseModel):
             self.yaml["backbone"][0][2] = "nn.Identity"  # バックボーンをIdentityに変更
 
         # Define model
-        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels。入力チャンネル
-        if nc and nc != self.yaml["nc"]:  # クラス数が異なる場合
-            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")  # ログを出力
-            self.yaml["nc"] = nc  # override YAML value。YAML値をオーバーライド
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist。モデルを解析
-
-        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict。デフォルトの名前辞書
-        self.inplace = self.yaml.get("inplace", True)  # inplaceを設定
-        self.end2end = getattr(self.model[-1], "end2end", False)  # end2endを設定
+        self.yaml["channels"] = ch  # save channels
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
+        self.end2end = getattr(self.model[-1], "end2end", False)
 
         # Build strides
         m = self.model[-1]  # Detect() ヘッドの定義
@@ -585,7 +590,7 @@ def torch_safe_load(weight, safe_only=False):
                 )
             ) from e
         LOGGER.warning(
-            f"WARNING ⚠️ {weight} appears to require '{e.name}', which is not in Ultralytics requirements."
+            f"{weight} appears to require '{e.name}', which is not in Ultralytics requirements."
             f"\nAutoInstall will run now for '{e.name}' but this feature will be removed in the future."
             f"\nRecommend fixes are to train a new model using the latest 'ultralytics' package or to "
             f"run a command with an official Ultralytics model, i.e. 'yolo predict model=yolov8n.pt'"
@@ -731,10 +736,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy=False
                 if scale in "mlx":
                     args[3] = True
-             
+            if m is C2fCIB:
+                legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
-        elif m in {HGStem, HGBlock}:
+        elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
             if m is HGBlock:
@@ -746,7 +752,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, ImagePoolingAttn, v10Detect, Detectv2}:
+        elif m in frozenset({Detect, ImagePoolingAttn, v10Detect, Detectv2}):
             if isinstance(f, list) and f and isinstance(f[0], list):
                 args.append([[ch[x] for x in sub_f] for sub_f in f])
             else:
