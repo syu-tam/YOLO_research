@@ -249,14 +249,15 @@ class Detectv2(nn.Module):
         self.stride = torch.zeros(self.nl)  # strides computed during build。ビルド中に計算されたストライド
         c2, c3 = max((16, self.ch[0] // 4, self.reg_max * 4)), max(self.ch[0], min(self.nc, 100))  # channels。チャンネル
         "ch[0]とch[1]のチャネル数を一致させるためのconv層"
+
         self.align_conv = nn.ModuleList(
-           nn.Conv2d(input_ch, out_ch, kernel_size=1, stride=1)
+           Conv(input_ch, out_ch, k=1, s=1, act=True)
            for input_ch, out_ch in zip(ch[0],ch[1])
         )
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in self.ch
         )  # 畳み込みレイヤー
-        
+
         
         self.cv3 = (
             nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in self.ch)
@@ -273,13 +274,9 @@ class Detectv2(nn.Module):
         
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()  # DFLを設定  
 
-        self.one2one_cv2 = copy.deepcopy(self.cv2)  # cv2をコピー
-        self.one2one_cv3 = copy.deepcopy(self.cv3)  # cv3をコピー  
+        self.aux_cv2 = copy.deepcopy(self.cv2)  # cv2をコピー
+        self.aux_cv3 = copy.deepcopy(self.cv3)  # cv3をコピー  
         
-        self.feature_maps = {
-            'pre_pan': [],   # 4,6,10の出力 (PAN前)
-            'post_pan': [],  # 23,24,25の出力 (1x1 Conv後)
-        }  
         
         self.skip_nms = False
         
@@ -312,31 +309,33 @@ class Detectv2(nn.Module):
             self.align_conv[i](pre_pan_feats[i]) for i in range(self.nl)
         ]
         
-        # self.feature_maps['pre_pan'] = list(pre_pan_feats_aligned)
-        # self.feature_maps['post_pan'] = list(post_pan_feats)
-        
-        one2many = [
+        main_head = [
             torch.cat((self.cv2[i](post_pan_feats[i]), self.cv3[i](post_pan_feats[i])), 1) for i in range(self.nl)
         ]
         
-
-        #if self.is_predict == False:
-        one2one = [
-                    torch.cat((self.one2one_cv2[i](pre_pan_feats_aligned[i]), self.one2one_cv3[i](pre_pan_feats_aligned[i])), 1) for i in range(self.nl)
+        aux_head = [
+                    torch.cat((self.aux_cv2[i](pre_pan_feats_aligned[i]), self.aux_cv3[i](pre_pan_feats_aligned[i])), 1) for i in range(self.nl)
                 ]  # one2oneを計算
-        # else:
-        #     one2one = None
         
         # 特徴を連結
         
         if self.training:  # Training path。トレーニングパスの場合
-            return {"one2many": one2many, "one2one": one2one}  # one2manyとone2oneを返す
+            return {
+                    "main_head": main_head,
+                    "aux_head": aux_head,
+                    "pre_pan":  pre_pan_feats_aligned,
+                    "post_pan": post_pan_feats
+                    }  # one2manyとone2oneを返す
         
 
-        y = self._inference(one2many)  # 推論を実行
+        y = self._inference(main_head)  # 推論を実行
         if self.skip_nms is True:
             y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)  # 後処理を実行
-        return y if self.export else (y, {"one2many": one2many, "one2one": one2one})  # 結果を返す
+        return y if self.export else (y, 
+                                      {"main_head": main_head,
+                                        "aux_head": aux_head,
+                                        "pre_pan":  pre_pan_feats_aligned,
+                                        "post_pan": post_pan_feats} ) # one2manyとone2oneを返す
 
     
     
@@ -378,7 +377,7 @@ class Detectv2(nn.Module):
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from。fromを反復処理
             a[-1].bias.data[:] = 1.0  # box。ボックス
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)。cls
-        for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from。fromを反復処理
+        for a, b, s in zip(m.aux_cv2, m.aux_cv3, m.stride):  # from。fromを反復処理
             a[-1].bias.data[:] = 1.0  # box。ボックス
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)。cls
 

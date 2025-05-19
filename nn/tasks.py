@@ -269,6 +269,7 @@ class BaseModel(nn.Module):
         #     preds (torch.Tensor | List[torch.Tensor]): 予測。
         if getattr(self, "criterion", None) is None:  # 基準がない場合
             self.criterion = self.init_criterion()  # 基準を初期化
+            self.criterion.total_epochs = self.total_epochs  # エポック数を設定
         preds = self.forward(batch["img"]) if preds is None else preds  # 予測を計算
         return self.criterion(preds, batch)  # 損失を計算
 
@@ -283,14 +284,11 @@ class DetectionModel(BaseModel):
     def __init__(self, cfg="yolov8n.yaml", ch=3, nc=None, verbose=True):
         super().__init__()
         self.is_predict = False  # モデルの予測フラグを設定
-        self.feature_maps = {
-            'indices': {
+        self.feature_indices = {
                 'pre_pan': [4, 6, 10],  # P3, P4, P5のインデックス
                 'post_pan': [16, 19, 22]  # 1x1 Conv層のインデックス
             }
-        }
     
-        
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict。cfg dict
         if self.yaml["backbone"][0][2] == "Silence":  # バックボーンがサイレンスの場合
             LOGGER.warning(
@@ -319,7 +317,7 @@ class DetectionModel(BaseModel):
                 """Performs a forward pass through the model, handling different Detect subclass types accordingly."""
                 # モデルを介して順方向パスを実行し、それに応じて異なるDetectサブクラスタイプを処理します。
                 if self.end2end:  # end2endの場合
-                    return self.forward(x)["one2many"]  # one2manyを返す
+                    return self.forward(x)["main_head"]  # one2manyを返す
                 return self.forward(x)  # 順方向パスを返す
 
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward。順方向パスを実行
@@ -333,17 +331,20 @@ class DetectionModel(BaseModel):
         if verbose:  # 詳細モードの場合
             self.info()  # 情報を表示
             LOGGER.info("")  # 空白行を出力
-    
+
+            
+
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
         """Forward pass through model with improved feature map management."""
         y = []
-        feature_manager = FeatureMapManager()
+        feature_manager = FeatureMapManager(self.feature_indices)
         
         for i, m in enumerate(self.model):
             if isinstance(m, Detectv2):
                 m.is_predict =  self.is_predict  # モデルの予測フラグを設定
-                x = [feature_manager.pre_pan_features, feature_manager.post_pan_features]
+                features = feature_manager.get_features()
+                x = [features['pre_pan'], features['post_pan']]
             elif m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
@@ -483,20 +484,28 @@ def temporary_modules(modules=None, attributes=None):
                 del sys.modules[old]
 
 class FeatureMapManager:
-    def __init__(self):
-        self.pre_pan_indices = set([4, 6, 10])  # P3, P4, P5のインデックス
-        self.post_pan_indices = set([16, 19, 22])  # 1x1 Conv層のインデックス
-        self.pre_pan_features = []
-        self.post_pan_features = []
+    def __init__(self, feature_indices):
+        """
+        Args:
+            feature_indices (dict): 保存する特徴マップのインデックス
+                例: {'pre_pan': [4, 6, 10], 'post_pan': [16, 19, 22]}
+        """
+        self.indices = {k: set(v) for k, v in feature_indices.items()}
+        self.features = {k: [] for k in feature_indices.keys()}
         
     def should_save_feature(self, index):
-        return index in self.pre_pan_indices or index in self.post_pan_indices
+        """指定されたインデックスの特徴マップを保存すべきかどうか"""
+        return any(index in indices for indices in self.indices.values())
         
     def store_feature(self, index, feature):
-        if index in self.pre_pan_indices:
-            self.pre_pan_features.append(feature)
-        elif index in self.post_pan_indices:
-            self.post_pan_features.append(feature)
+        """特徴マップを適切なリストに保存"""
+        for key, indices in self.indices.items():
+            if index in indices:
+                self.features[key].append(feature)
+                
+    def get_features(self):
+        """保存された特徴マップを取得"""
+        return self.features
             
 class SafeClass:
     """A placeholder class to replace unknown classes during unpickling."""

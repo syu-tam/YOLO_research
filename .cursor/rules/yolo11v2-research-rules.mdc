@@ -1,0 +1,87 @@
+---
+description: 
+globs: *
+alwaysApply: false
+---
+# YOLO Knowledge Distillation Project
+
+## Project Overview
+This project implements efficient knowledge distillation in a YOLOv11-based object detection model. 
+The implementation introduces a novel distillation approach utilizing features before and after the PAN network.
+
+## Core Components
+
+### Detection Model
+The main detection model is implemented in [nn/tasks.py](mdc:nn/tasks.py). Key features:
+- Uses `FeatureMapManager` to handle feature maps
+- Supports both training and inference modes
+- Feature indices management:
+  ```python
+  feature_indices = {
+      'pre_pan': [4, 6, 10],   # P3, P4, P5
+      'post_pan': [16, 19, 22] # 1x1 Conv layers
+  }
+  ```
+
+### Detection Head
+The detection head implementation is in [nn/modules/head.py](mdc:nn/modules/head.py):
+- `Detectv2` class implements dual-head architecture:
+  - Main head (Teacher): Uses post-PAN features
+  - Aux head (Student): Uses pre-PAN features
+- Uses `align_conv` to match channel dimensions between paths
+
+### Loss Calculation
+Loss computation is handled in [utils/loss.py](mdc:utils/loss.py):
+```python
+# Loss Components
+total_loss = detection_loss + distillation_loss
+where:
+- detection_loss = main_head_loss + aux_head_loss
+- distillation_loss = pan_loss + knowledge_distillation_loss
+# Statistics Structure
+stats = [
+    box_loss,   # Bounding box loss
+    cls_loss,   # Classification loss
+    dfl_loss,   # Distribution Focal Loss
+    pan_loss,   # PAN distillation loss
+    kd_loss     # Knowledge distillation loss
+]
+```
+
+## Knowledge Distillation Architecture
+
+### 1. **Prediction Distillation**
+- Distillation between teacher and student predictions
+- Through teacher head architect
+
+### 2. **Feature Distillation**
+- Direct distillation between pre-PAN and post-PAN features
+- Channel-wise feature alignment
+
+## Feature Flow
+Input → Backbone → pre-PAN features → PAN → post-PAN features
+                    ↓                        ↓
+                 Student Head            Teacher Head
+                    ↓                        ↓
+              Auxiliary Loss           Main Detection Loss
+                    ↓                        ↓
+                    └──── Knowledge Distillation ────┘
+
+## Implementation Notes
+
+### Training Considerations
+1. Configurable teacher-student interaction
+2. Student path designed for efficiency
+3. Flexible distillation strategy
+4. Adjustable loss weighting
+
+### Expected Benefits
+1. High accuracy with lightweight model
+2. Efficient knowledge transfer
+3. Improved speed-accuracy trade-off
+
+### Key Files
+- [nn/modules/head.py](mdc:nn/modules/head.py): Dual-head detector implementation
+- [nn/tasks.py](mdc:nn/tasks.py): Feature map management and inference
+- [utils/loss.py](mdc:utils/loss.py): Loss computation implementation
+    

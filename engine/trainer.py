@@ -302,6 +302,7 @@ class BaseTrainer:
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")  # メトリックキーを取得
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))  # メトリクスを初期化
             self.ema = ModelEMA(self.model)  # EMAを初期化
+            self.ema.ema.total_epochs = self.epochs
             if self.args.plots:  # プロットする場合
                 self.plot_training_labels()  # トレーニングラベルをプロット
 
@@ -354,6 +355,8 @@ class BaseTrainer:
             self.model.total_epochs = self.epochs  # プロパティを通して_total_epochsを更新
             self.epoch = epoch  # エポックを設定
             self.run_callbacks("on_train_epoch_start")
+            if hasattr(self.model, "criterion"):  # sync_bnがある場合
+                self.model.criterion.current_epoch = epoch  # 現在のエポックを設定
             
             with warnings.catch_warnings():  # 警告をキャッチ
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'。'optimizer.step（）の前にlr_scheduler.step（）が検出されました'を抑制

@@ -1,0 +1,21 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# KITTI 2D Object Detection dataset
+# Documentation: https://www.cvlibs.net/datasets/kitti/
+# Example usage: yolo train data=kitti.yaml
+
+path: ../datasets/kitti     # dataset root dir
+train: train/images         # train 用画像ディレクトリ
+val:   val/images           # val 用画像ディレクトリ
+# test: testing/image_2     # (必要であれば)公式テストセット画像
+
+nc: 8                      # クラス数
+
+names:
+  0: Car
+  1: Van
+  2: Truck
+  3: Pedestrian
+  4: Person_sitting
+  5: Cyclist
+  6: Tram
+  7: Misc

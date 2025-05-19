@@ -10,7 +10,7 @@ import os
 # 引数で seed を受け取る
 # -------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--seed', type=int, required=True)
+parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')
 args = parser.parse_args()
 seed = args.seed
 
@@ -18,14 +18,14 @@ seed = args.seed
 mode = "train"
 method = 'yolov11'
 model_size = 'n'
-data = "coco.yaml"
-batch = 64
-epochs = 500
+data = "VisDrone.yaml"
+batch = 16
+epochs = 1000
 patience = 50
 is_wandb = True
 
 # 保存先設定
-train_project = os.path.join(f"result/v{method.replace('yolov', '')}/{data.replace('.yaml', '')}/{model_size}/LD(t=1)")
+train_project = os.path.join(f"result/v{method.replace('yolov', '')}/{data.replace('.yaml', '')}/{model_size}/test")
 val_project = os.path.join(f"result/v{method.replace('yolov', '')}/{data.replace('.yaml', '')}/{model_size}/LD(t=1)")
 name = f"{model_size}_seed{seed}"
 
@@ -39,7 +39,7 @@ if mode == 'train':
     if not is_wandb:
         os.environ["WANDB_DISABLED"] = "true"
 
-    wandb.init(project=f"{data.replace('.yaml', '')}", name=f"{method.replace('yolov', 'v')}_{model_size}_seed{seed}_LD(t=1)")
+    wandb.init(project=f"{data.replace('.yaml', '')}", name=f"{method.replace('yolov', 'v')}_{model_size}_seed{seed}_test")
 
     if 'yolo' in method:
         model = YOLO(model_config, task='detect')

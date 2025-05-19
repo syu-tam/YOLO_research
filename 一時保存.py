@@ -179,128 +179,74 @@ class PANFeatureLoss(nn.Module):
         return feature_loss
 
 
-# class DistillationLoss(nn.Module):
-#     def __init__(self, temperature_dfl=3.0):
-#         super().__init__()
-#         self.temperature_dfl = temperature_dfl
-
-#     def forward(self, teacher_preds, student_preds, fg_mask, reg_max, nc):
-#         device = teacher_preds[0].device
-#         total_cls = torch.tensor(0., device=device)
-#         total_dfl = torch.tensor(0., device=device)
-#         total_fg  = torch.tensor(0., device=device)
-
-#         with autocast(enabled=False):
-#             teacher_preds = [t.detach().float() for t in teacher_preds]
-#             student_preds = [s.float() for s in student_preds]
-#             T_dfl = self.temperature_dfl
-#             reg4  = reg_max * 4
-
-#             # スケールごとに損失を集計
-#             for i, (t_feat, s_feat) in enumerate(zip(teacher_preds, student_preds)):
-#                 _, _, H, W = t_feat.shape
-                
-#                 # === 正例マスクと確信度マスクの組み合わせ ===
-#                 flat_fg_mask = fg_mask[:, i*H*W:(i+1)*H*W].reshape(-1)
-                
-#                 if not flat_fg_mask.any():
-#                     continue
-                
-#                 # === クラス蒸留 KLD ===
-#                 t_cls = (t_feat[:, reg4:, ...].permute(0,2,3,1).reshape(-1, nc))
-#                 s_cls = (s_feat[:, reg4:, ...].permute(0,2,3,1).reshape(-1, nc))
-                
-#                 with torch.no_grad():
-#                     # fg_maskが適用されている部分のみの予測を取得
-#                     t_prob = torch.sigmoid(t_cls[flat_fg_mask])
-#                     s_prob = torch.sigmoid(s_cls[flat_fg_mask])
-
-#                 # バイナリクロスエントロピーベースの蒸留
-#                 kld_cls = F.binary_cross_entropy_with_logits(
-#                     s_cls, torch.sigmoid(t_cls), reduction="none"
-#                 ).mean(dim=1)
-
-#                 # === DFL蒸留 KLD ===
-#                 t_dfl = (t_feat[:, :reg4, ...].permute(0,2,3,1).reshape(-1, 4, reg_max))
-#                 s_dfl = (s_feat[:, :reg4, ...].permute(0,2,3,1).reshape(-1, 4, reg_max))
-
-#                 with torch.no_grad():
-#                     t_prob_dfl = (t_dfl / T_dfl).softmax(dim=2)
-                
-#                 kld_dfl = -(t_prob_dfl * F.log_softmax(s_dfl / T_dfl, dim=2)).sum(dim=2).mean(dim=1) * (T_dfl**2)
-
-#                 if flat_fg_mask.any():
-#                     total_cls += kld_cls[flat_fg_mask].sum()
-#                     total_dfl += kld_dfl[flat_fg_mask].sum() / (reg_max * 4)
-#                     total_fg  += flat_fg_mask.sum()
-
-#             # まとめて正規化
-#             total_fg = total_fg.clamp(min=1)
-#             print(50*total_cls/total_fg, total_dfl/total_fg)
-#             loss_per_fg = (total_dfl + 50*total_cls) / total_fg
-
-#         return loss_per_fg
-
 class DistillationLoss(nn.Module):
-    def __init__(self, temperature_cls=3.0, temperature_dfl=3.0):
+    def __init__(self, 
+                 temperature_cls=3.0, 
+                 temperature_dfl=3.0, 
+                 confidence_threshold=0.5,
+                 iou_threshold=0.5):
         super().__init__()
         self.temperature_cls = temperature_cls
         self.temperature_dfl = temperature_dfl
-
-    def forward(self, teacher_preds, student_preds, fg_mask, reg_max, nc, target_scores):
+        self.confidence_threshold = confidence_threshold
+        self.iou_threshold = iou_threshold
+        
+    def forward(self, teacher_preds, student_preds, fg_mask, reg_max, nc):
         device = teacher_preds[0].device
-        T_cls2 = self.temperature_cls ** 2
-        T_dfl2 = self.temperature_dfl ** 2
-
-        cls_loss_sum = torch.zeros((), device=device)
-        dfl_loss_sum = torch.zeros((), device=device)
-        weight_sum   = torch.tensor(0., device=device)  # スコア合計
-
-        # teacher_preds, student_preds はリスト
-        t_feats = [t.detach().float() for t in teacher_preds]
-        s_feats = [s.float() for s in student_preds]
-
-        # target_scores: (B, A, C) の one-hot スコア → 各 anchor の信頼度を取得
-        # ここではクラススコアとして max を取ります (あるいはアラインメント値そのまま使ってもOK)
-        # flat_scores: (B*A,)
-        flat_scores = target_scores.max(dim=-1)[0].reshape(-1)
+        total_cls = torch.tensor(0., device=device)
+        total_dfl = torch.tensor(0., device=device)
+        total_fg  = torch.tensor(0., device=device)
 
         with autocast(enabled=False):
-            for i, (t_feat, s_feat) in enumerate(zip(t_feats, s_feats)):
-                B, C, H, W = t_feat.shape
-                N = B * H * W
-                mask = fg_mask[:, i*H*W:(i+1)*H*W].reshape(-1)
-                idx  = mask.nonzero(as_tuple=False).squeeze(1)
-                if idx.numel() == 0:
-                    continue
+            teacher_preds = [t.detach().float() for t in teacher_preds]
+            student_preds = [s.float() for s in student_preds]
 
-                # このスケールの信頼度ベクトル
-                w = flat_scores[idx]  # (n_idx,)
+            T     = self.temperature_cls
+            T_dfl = self.temperature_dfl
+            reg4  = reg_max * 4
 
-                # --- クラス蒸留 ---
-                t_cls = t_feat[:, 4*reg_max:, ...].permute(0,2,3,1).reshape(N, nc)
-                s_cls = s_feat[:, 4*reg_max:, ...].permute(0,2,3,1).reshape(N, nc)
-                t_sel, s_sel = t_cls[idx], s_cls[idx]
-                p_t   = F.softmax(t_sel / self.temperature_cls, dim=1)
-                log_q = F.log_softmax(s_sel / self.temperature_cls, dim=1)
-                ce_per = -(p_t * log_q).sum(dim=1) * T_cls2  # (n_idx,)
-                cls_loss_sum += (w * ce_per).sum()
+            # スケールごとに損失を集計
+            for i, (t_feat, s_feat) in enumerate(zip(teacher_preds, student_preds)):
+                _, _, H, W = t_feat.shape
+                # === クラス蒸留 KLD ===
+                t_cls = (t_feat[:, reg4:, ...].permute(0,2,3,1).reshape(-1, nc))
+                s_cls = (s_feat[:, reg4:, ...].permute(0,2,3,1).reshape(-1, nc))
+                
+                # 教師モデルの確信度を計算
+                with torch.no_grad():
+                    t_prob = torch.sigmoid(t_cls / T)
+                    t_conf = torch.sigmoid(t_cls).max(dim=1)[0]
+            
+                # バイナリクロスエントロピーベースの蒸留
+                kld_cls = F.binary_cross_entropy_with_logits(
+                    s_cls / T, t_prob, reduction="none"
+                ).mean(dim=1) * (T**2)
 
-                # --- DFL蒸留 ---
-                t_dfl = t_feat[:, :4*reg_max, ...].permute(0,2,3,1).reshape(N, 4, reg_max)
-                s_dfl = s_feat[:, :4*reg_max, ...].permute(0,2,3,1).reshape(N, 4, reg_max)
-                t_d_sel, s_d_sel = t_dfl[idx], s_dfl[idx]
-                p_t_d   = F.softmax(t_d_sel / self.temperature_dfl, dim=2)
-                log_q_d = F.log_softmax(s_d_sel / self.temperature_dfl, dim=2)
-                dfl_per = -(p_t_d * log_q_d).sum(dim=2).sum(dim=1) * T_dfl2  # (n_idx,)
-                dfl_loss_sum += (w * dfl_per).sum()
+                # === DFL蒸留 KLD ===
+                t_dfl = (t_feat[:, :reg4, ...].permute(0,2,3,1).reshape(-1, 4, reg_max))
+                s_dfl = (s_feat[:, :reg4, ...].permute(0,2,3,1).reshape(-1, 4, reg_max))
 
-                weight_sum += w.sum()
+                with torch.no_grad():
+                    t_prob_dfl = (t_dfl / T_dfl).softmax(dim=2)
+                
+                kld_dfl = -(t_prob_dfl * F.log_softmax(s_dfl / T_dfl, dim=2)).mean(dim=(1,2)) * (T_dfl**2)
 
-        # 正規化
-        weight_sum = weight_sum.clamp(min=1e-6)
-        loss = (cls_loss_sum + dfl_loss_sum) / weight_sum
-        return loss
+                # === 正例マスクと確信度マスクの組み合わせ ===
+                flat_mask = fg_mask[:, i*H*W:(i+1)*H*W].reshape(-1)
+                conf_mask = t_conf >= self.confidence_threshold
+                combined_mask = flat_mask & conf_mask
+
+                if combined_mask.any():
+                    total_cls += kld_cls[combined_mask].sum()
+                    total_dfl += kld_dfl[combined_mask].sum()
+                    total_fg  += combined_mask.sum()
+
+            # まとめて正規化
+            total_fg = total_fg.clamp(min=1)
+            loss_per_fg = (total_cls + total_dfl) / total_fg
+
+        return loss_per_fg
+
 
 class E2EDetectLoss:
     """Criterion class for computing training losses."""
@@ -313,30 +259,25 @@ class E2EDetectLoss:
         self.aux_loss = v8DetectionLoss(model, tal_topk=10)  # 1対1の損失を初期化
 
         device = next(model.parameters()).device
-        # Detectヘッドのstrideを渡す
+
         self.distill_losses = {
             'pan': PANFeatureLoss().to(device),
-            'kd' : DistillationLoss(
-                temperature_dfl=3.0
+            'cross_kd': DistillationLoss(
+                temperature_cls=3.0,
+                temperature_dfl=3.0,
+                confidence_threshold=0.5  # 確信度のしきい値を追加
             ).to(device)
         }
-
+        
         self.distill_weights = {
             'pan': 0.0,
-            'kd': 0.005
+            'cross_kd': 0.05
         }
-        
-        self.current_epoch = 0
-        self.total_epochs = None
-        
-        self.model = model
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         # バッチサイズを掛けた、ボックス、クラス、およびdflの損失の合計を計算します。
         preds = preds[1] if isinstance(preds, tuple) else preds  # 予測を取得
-        
-        batch_size = preds['main_head'][0].shape[0]
 
         # 検出損失の計算
         loss_main, loss_aux = self.compute_detection_losses(
@@ -354,16 +295,16 @@ class E2EDetectLoss:
         # 統計情報の更新
         stats = loss_main[1].clone().detach()
         stats[3] += distill_losses['pan'].detach()
-        stats[4] += distill_losses['kd'].detach()
+        stats[4] += distill_losses['cross_kd'].detach()
         
         # 最終的な損失の計算
         total_loss = (
             loss_main[0] + 
-            0.3*loss_aux[0] + 
-            batch_size * sum(distill_losses.values())
+            0.5 * loss_aux[0] + 
+            sum(distill_losses.values())
         )
         
-        return total_loss, stats + 0.3*loss_aux[1]
+        return total_loss, stats + 0.5 * loss_aux[1]
     
     def compute_detection_losses(self, main_head, aux_head, batch):
         """検出損失の計算"""
@@ -383,14 +324,13 @@ class E2EDetectLoss:
             fg_mask
         )
         
-
-        losses['kd'] = self.distill_weights['kd'] * self.distill_losses['kd'](
-            teacher_preds   = features['main_head'],
-            student_preds   = features['aux_head'],
-            fg_mask         = fg_mask,
-            reg_max         = self.main_loss.reg_max,
-            nc              = self.main_loss.nc,
-            target_scores   = self.main_loss.target_scores
+        # CrossKD損失
+        losses['cross_kd'] = self.distill_weights['cross_kd'] * self.distill_losses['cross_kd'](
+            teacher_preds=features['main_head'],
+            student_preds=features['aux_head'],
+            fg_mask=fg_mask,
+            reg_max=self.main_loss.reg_max,
+            nc=self.main_loss.nc
         )
         
         return losses
@@ -477,8 +417,8 @@ class v8DetectionLoss:
         targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)  # ターゲットを連結
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])  # ターゲットを前処理
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy。ラベルとバウンディングボックスを取得
-        
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)  # マスクを生成
+
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)。バウンディングボックスをデコード
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
@@ -492,12 +432,11 @@ class v8DetectionLoss:
             gt_labels,
             gt_bboxes,
             mask_gt,
-        )  # アサインを実
+        )  # アサインを実行
 
         target_scores_sum = max(target_scores.sum(), 1)  # ターゲットスコアの合計
 
         self.target_scores = target_scores # ターゲットスコアの合計を保存
-        self.last_fg_mask = fg_mask  # (B, A)
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way。VFL法
@@ -509,7 +448,8 @@ class v8DetectionLoss:
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
-    
+        
+        self.last_fg_mask = fg_mask  # (B, A)
 
         loss[0] *= self.hyp.box  # box gain。ボックスゲイン
         loss[1] *= self.hyp.cls  # cls gain。clsゲイン
